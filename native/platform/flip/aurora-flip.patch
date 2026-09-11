@@ -1,16 +1,17 @@
 diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
-index f8f9461..9e68a31 100644
+index f8f9461..350b141 100644
 --- a/cmake/aurora_gx.cmake
 +++ b/cmake/aurora_gx.cmake
-@@ -3,6 +3,7 @@ add_library(aurora_gx STATIC
+@@ -3,6 +3,8 @@ add_library(aurora_gx STATIC
          lib/gfx/depth_peek.cpp
          lib/gfx/encoding.cpp
          lib/gfx/frame.cpp
 +        lib/gfx/flip_gles.cpp
++        lib/gfx/flip_sprites.cpp
          lib/gfx/pipeline_cache.cpp
          lib/gfx/recording.cpp
          lib/gfx/render_worker.cpp
-@@ -19,6 +20,8 @@ add_library(aurora_gx STATIC
+@@ -19,6 +21,8 @@ add_library(aurora_gx STATIC
          lib/gx/regs.cpp
          lib/gx/dl.cpp
          lib/gx/fifo.cpp
@@ -51,7 +52,7 @@ index 1a312fb..ea9f8a2 100644
  
  
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index 9430842..bfc0b69 100644
+index 9430842..6ac83fd 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -1,13 +1,27 @@
@@ -127,7 +128,7 @@ index 9430842..bfc0b69 100644
    auto imguiDrawData = imgui::freeze();
  
    const auto& presentSource = webgpu::present_source();
-@@ -285,12 +318,18 @@ void end_frame() noexcept {
+@@ -285,12 +318,32 @@ void end_frame() noexcept {
    }
  #endif
  
@@ -144,10 +145,24 @@ index 9430842..bfc0b69 100644
 +    auto phaseNow = std::chrono::steady_clock::now();
 +    const auto phase = [&](double& acc) { const auto n = std::chrono::steady_clock::now(); acc += std::chrono::duration<double, std::milli>(n - phaseNow).count(); phaseNow = n; };
 +#endif
++#ifdef MELEE_MIYOO_FLIP
++    // Scene-on-surface: the frame's EFB passes already rendered into a
++    // presented texture acquired at encode time.
++    bool sceneOnSurface = false;
++    if (auto [surfaceTexture, surfaceView] = gfx::detail::take_flip_frame_surface(); surfaceTexture) {
++      currentTexture = std::move(surfaceTexture);
++      currentView = std::move(surfaceView);
++      surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal;
++      sceneOnSurface = true;
++    }
++    if (!sceneOnSurface)
++#else
++    constexpr bool sceneOnSurface = false;
++#endif
      {
        window::SurfaceLock surfaceLock;
        if (window::is_presentable() && g_surface) {
-@@ -305,14 +344,33 @@ void end_frame() noexcept {
+@@ -305,14 +358,51 @@ void end_frame() noexcept {
        }
      }
  
@@ -155,7 +170,26 @@ index 9430842..bfc0b69 100644
 +    if (phaseProfile) phase(acquireMs);
 +#endif
      const bool canPresent = currentTexture && currentView;
-     if (canPresent) {
+-    if (canPresent) {
++    // Scene-on-surface: the scene is already in the presented texture when no
++    // overlay is composited and the viewport covers the whole surface.
++    const bool fullSurfaceViewport =
++        viewport.left == 0.f && viewport.top == 0.f &&
++        static_cast<uint32_t>(viewport.width + 0.5f) == webgpu::g_graphicsConfig.surfaceConfiguration.width &&
++        static_cast<uint32_t>(viewport.height + 0.5f) == webgpu::g_graphicsConfig.surfaceConfiguration.height;
++    const bool skipPresentCopy = sceneOnSurface && !(rmlBindGroup && rmlOverlay) && fullSurfaceViewport;
++    if (canPresent && skipPresentCopy) {
++      // Test captures read the EFB texture: mirror the surface into it.
++      static const bool captureCopy = std::getenv("MELEE_MATRIX_TEST") != nullptr || std::getenv("MELEE_RENDER_CHECK") != nullptr;
++      if (captureCopy) {
++        const auto& efb = webgpu::present_source();
++        const wgpu::TexelCopyTextureInfo src{.texture = currentTexture};
++        const wgpu::TexelCopyTextureInfo dst{.texture = efb.texture};
++        const wgpu::Extent3D size{efb.size.width, efb.size.height, 1};
++        encoder.CopyTextureToTexture(&src, &dst, &size);
++      }
++    }
++    if (canPresent && !skipPresentCopy) {
        wgpu::BindGroup presentBindGroup;
        if (rmlBindGroup && !rmlOverlay) {
          presentBindGroup = rmlBindGroup;
@@ -183,10 +217,12 @@ index 9430842..bfc0b69 100644
        }
        {
          const std::array attachments{
-@@ -343,6 +401,11 @@ void end_frame() noexcept {
+@@ -343,6 +433,13 @@ void end_frame() noexcept {
          }
          pass.End();
        }
++    }
++    if (canPresent) {
 +#ifdef MELEE_MIYOO_FLIP
 +      // An empty overlay still costs the driver a render pass; skip it in-game.
 +      static const bool skipEmptyImgui = [] { const char* v = std::getenv("MELEE_FLIP_SKIP_EMPTY_IMGUI"); return !v || std::strcmp(v, "0"); }();
@@ -195,7 +231,7 @@ index 9430842..bfc0b69 100644
        {
          const std::array attachments{
              wgpu::RenderPassColorAttachment{
-@@ -369,9 +432,21 @@ void end_frame() noexcept {
+@@ -369,9 +466,21 @@ void end_frame() noexcept {
      webgpu::gpu_prof::frame_end(encoder);
      const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
      const auto buffer = encoder.Finish(&cmdBufDescriptor);
@@ -217,7 +253,7 @@ index 9430842..bfc0b69 100644
      }
      webgpu::gpu_prof::after_submit();
      if (canPresent && g_surface) {
-@@ -380,9 +455,26 @@ void end_frame() noexcept {
+@@ -380,9 +489,26 @@ void end_frame() noexcept {
        {
          window::SurfaceLock surfaceLock;
          if (window::is_presentable()) {
@@ -229,8 +265,8 @@ index 9430842..bfc0b69 100644
 +          MeleeFlipProfileSwap(false);
 +          MeleeFlipPresent();
 +#endif
-+        }
-+      }
+         }
+       }
 +#ifdef MELEE_MIYOO_FLIP
 +      if (phaseProfile) {
 +        phase(presentMs);
@@ -238,13 +274,13 @@ index 9430842..bfc0b69 100644
 +          std::fprintf(stderr, "[flip-render-callback] acquire_ms=%.3f encode_ms=%.3f submit_ms=%.3f present_ms=%.3f\n",
 +                       acquireMs / 120, encodeMs / 120, submitMs / 120, presentMs / 120);
 +          acquireMs = encodeMs = submitMs = presentMs = 0;
-         }
-       }
++        }
++      }
 +#endif
        if (status) {
          gfx::after_present();
        } else {
-@@ -439,7 +531,19 @@ void end_frame() noexcept {
+@@ -439,7 +565,19 @@ void end_frame() noexcept {
      TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(stats.lastIndexSize));
      TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(stats.lastStorageSize));
      TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(stats.lastTextureUploadSize));
@@ -265,7 +301,7 @@ index 9430842..bfc0b69 100644
  
  #endif
  }
-@@ -451,6 +555,13 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
+@@ -451,6 +589,13 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
    return aurora::initialize(argc, argv, *config);
  }
  void aurora_shutdown() { aurora::shutdown(); }
@@ -476,10 +512,10 @@ index 0f7a946..007ba10 100644
 +#endif
  } // namespace aurora::gfx::clear
 diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
-index b3054be..8aa302a 100644
+index b3054be..55bc730 100644
 --- a/lib/gfx/encoding.cpp
 +++ b/lib/gfx/encoding.cpp
-@@ -1,4 +1,13 @@
+@@ -1,4 +1,14 @@
 +#ifdef MELEE_MIYOO_FLIP
 +#include <chrono>
 +#include "../gx/flip_vertex.hpp"
@@ -489,11 +525,66 @@ index b3054be..8aa302a 100644
 +#ifdef MELEE_MIYOO_FLIP
 +#include "flip_upload.hpp"
 +#include "flip_profile.hpp"
++#include "flip_sprites.hpp"
 +#endif
  
  #include "frame.hpp"
  
-@@ -246,6 +255,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+@@ -13,6 +23,7 @@
+ #include "../rmlui/pipeline.hpp"
+ #endif
+ #include "../webgpu/gpu.hpp"
++#include "../window.hpp"
+ #include "../webgpu/gpu_prof.hpp"
+ 
+ #include <algorithm>
+@@ -200,11 +211,44 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+     return;
+   }
+ 
++#ifdef MELEE_MIYOO_FLIP
++  // Scene-on-surface: EFB passes render into the presented texture. The
++  // texture is acquired when the frame's first EFB pass is encoded (the render
++  // worker has presented the previous frame by then) and handed to end_frame.
++  bool sceneOnSurface = false;
++  {
++    const auto& scene = passInfo.colorAttachments[SceneColorAttachmentIndex];
++    const auto& surfaceConfig = webgpu::g_graphicsConfig.surfaceConfiguration;
++    if (flip_scene_on_surface_enabled() && passInfo.msaaSamples == 1 && passInfo.colorAttachmentCount == 1 &&
++        scene.view && scene.view.Get() == webgpu::g_frameBuffer.view.Get() && scene.size.width == surfaceConfig.width &&
++        scene.size.height == surfaceConfig.height) {
++      if (!frame.flipSurfaceTried) {
++        frame.flipSurfaceTried = true;
++        window::SurfaceLock surfaceLock;
++        if (window::is_presentable() && webgpu::g_surface) {
++          wgpu::SurfaceTexture surfaceTexture;
++          webgpu::g_surface.GetCurrentTexture(&surfaceTexture);
++          if (surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal && surfaceTexture.texture) {
++            frame.flipSurfaceTexture = std::move(surfaceTexture.texture);
++            frame.flipSurfaceView = frame.flipSurfaceTexture.CreateView();
++          }
++        }
++      }
++      sceneOnSurface = static_cast<bool>(frame.flipSurfaceView);
++    }
++  }
++  const wgpu::Texture& copySourceTexture = sceneOnSurface ? frame.flipSurfaceTexture : passInfo.copySourceTexture;
++  const wgpu::TextureView& copySourceView = sceneOnSurface ? frame.flipSurfaceView : passInfo.copySourceView;
++#else
++  constexpr bool sceneOnSurface = false;
++  const wgpu::Texture& copySourceTexture = passInfo.copySourceTexture;
++  const wgpu::TextureView& copySourceView = passInfo.copySourceView;
++#endif
+   std::array<wgpu::RenderPassColorAttachment, MaxColorAttachments> attachments{};
+   for (uint32_t i = 0; i < passInfo.colorAttachmentCount; ++i) {
+     const auto& source = passInfo.colorAttachments[i];
+     attachments[i] = {
+-        .view = source.view,
++        .view = (sceneOnSurface && i == SceneColorAttachmentIndex) ? frame.flipSurfaceView : source.view,
+         .resolveTarget = source.resolveView,
+         .loadOp = source.loadOp != wgpu::LoadOp::Undefined ? source.loadOp
+                                                            : (source.clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load),
+@@ -246,6 +290,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
    };
  
    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
@@ -503,7 +594,117 @@ index b3054be..8aa302a 100644
    render_pass(pass, frame, passInfo);
    pass.End();
  
-@@ -353,8 +365,35 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
+@@ -254,20 +301,21 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
+   }
+ 
+-  if (passInfo.resolveTarget) {
+-    const auto& dstSize = passInfo.resolveTarget->size;
+-    const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
+-    const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
+-                              dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
+-    const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
++  const auto resolve = [&](const TextureHandle& resolveTarget, GXTexFmt resolveFormat, const ClipRect& resolveRect,
++                           const Range& resolveUniformRange) {
++    const auto& dstSize = resolveTarget->size;
++    const bool needsConversion = tex_copy_conv::needs_conversion(resolveFormat);
++    const bool needsScaling = dstSize.width != static_cast<uint32_t>(resolveRect.width) ||
++                              dstSize.height != static_cast<uint32_t>(resolveRect.height);
++    const bool isDepth = gx::is_depth_format(resolveFormat);
+     if (isDepth && passInfo.msaaSamples > 1) {
+       Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+     }
+     const tex_copy_conv::ConvRequest convReq{
+-        .fmt = passInfo.resolveFormat,
+-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+-        .uniformRange = passInfo.resolveUniformRange,
+-        .dst = passInfo.resolveTarget,
++        .fmt = resolveFormat,
++        .srcView = isDepth ? passInfo.copySourceDepthView : copySourceView,
++        .uniformRange = resolveUniformRange,
++        .dst = resolveTarget,
+         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+     };
+     if (needsConversion) {
+@@ -277,29 +325,70 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+     } else {
+       const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
+       const wgpu::TexelCopyTextureInfo src{
+-          .texture = passInfo.copySourceTexture,
++          .texture = copySourceTexture,
+           .origin =
+               wgpu::Origin3D{
+-                  .x = static_cast<uint32_t>(passInfo.resolveRect.x),
+-                  .y = static_cast<uint32_t>(passInfo.resolveRect.y),
++                  .x = static_cast<uint32_t>(resolveRect.x),
++                  .y = static_cast<uint32_t>(resolveRect.y),
+               },
+       };
+       const wgpu::TexelCopyTextureInfo dst{
+-          .texture = passInfo.resolveTarget->texture,
++          .texture = resolveTarget->texture,
+       };
+       const wgpu::Extent3D size{
+-          .width = static_cast<uint32_t>(passInfo.resolveRect.width),
+-          .height = static_cast<uint32_t>(passInfo.resolveRect.height),
++          .width = static_cast<uint32_t>(resolveRect.width),
++          .height = static_cast<uint32_t>(resolveRect.height),
+           .depthOrArrayLayers = 1,
+       };
+       cmd.CopyTextureToTexture(&src, &dst, &size);
+     }
++  };
++#ifdef MELEE_MIYOO_FLIP
++  // Fused shadow pass: convert both copies in one two-target pass when they
++  // share the format and neither needs scaling (MELEE_FLIP_DUAL_CONV=0 splits).
++  static const bool dualConv = [] {
++    const char* v = std::getenv("MELEE_FLIP_DUAL_CONV");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  bool dualDone = false;
++  if (dualConv && passInfo.resolveTarget && passInfo.flipExtraResolves.size() == 1 &&
++      passInfo.flipDualResolveUniform.size == 32) {
++    const auto& extra = passInfo.flipExtraResolves[0];
++    const auto unscaled = [](const TextureHandle& target, const ClipRect& rect) {
++      return target->size.width == static_cast<uint32_t>(rect.width) &&
++             target->size.height == static_cast<uint32_t>(rect.height);
++    };
++    if (extra.target && extra.format == passInfo.resolveFormat && !gx::is_depth_format(passInfo.resolveFormat) &&
++        tex_copy_conv::dual_supported(passInfo.resolveFormat) && unscaled(passInfo.resolveTarget, passInfo.resolveRect) &&
++        unscaled(extra.target, extra.rect) && extra.target->size.width == passInfo.resolveTarget->size.width &&
++        extra.target->size.height == passInfo.resolveTarget->size.height) {
++      const tex_copy_conv::ConvRequest convReq{
++          .fmt = passInfo.resolveFormat,
++          .srcView = copySourceView,
++          .uniformRange = passInfo.resolveUniformRange,
++          .dst = passInfo.resolveTarget,
++          .sampleFilter = tex_copy_conv::SampleFilter::Nearest,
++      };
++      tex_copy_conv::run_dual(cmd, convReq, extra.target, passInfo.flipDualResolveUniform);
++      dualDone = true;
++    }
+   }
++  if (!dualDone) {
++#endif
++  if (passInfo.resolveTarget) {
++    resolve(passInfo.resolveTarget, passInfo.resolveFormat, passInfo.resolveRect, passInfo.resolveUniformRange);
++  }
++#ifdef MELEE_MIYOO_FLIP
++  for (const auto& extra : passInfo.flipExtraResolves) {
++    if (extra.target) resolve(extra.target, extra.format, extra.rect, extra.uniformRange);
++  }
++  }
++#endif
+ 
+   if (passInfo.snapshotColorDst) {
+     const webgpu::gpu_prof::Zone zone{cmd, "Pass snapshot"};
+     const wgpu::TexelCopyTextureInfo src{
+-        .texture = passInfo.copySourceTexture,
++        .texture = copySourceTexture,
+     };
+     const wgpu::TexelCopyTextureInfo dst{
+         .texture = passInfo.snapshotColorDst,
+@@ -353,8 +442,35 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
      return;
    }
    const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
@@ -540,7 +741,7 @@ index b3054be..8aa302a 100644
    copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
    copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                              res.uniformBuffer);
-@@ -363,12 +402,16 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
+@@ -363,12 +479,16 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
                              res.storageBuffer);
  
    if constexpr (UseTextureBuffer) {
@@ -558,7 +759,7 @@ index b3054be..8aa302a 100644
                    .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
                    .rowsPerImage = item.layout.rowsPerImage,
                },
-@@ -383,6 +426,145 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
+@@ -383,6 +503,149 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
  } // namespace
  
  namespace detail {
@@ -602,7 +803,11 @@ index b3054be..8aa302a 100644
 +    // Frames recorded into persistently mapped storage need Dawn copies of the
 +    // uniform windows and indices only when a pass falls back to the reference
 +    // renderer; qualified direct passes bind the mapped GL buffers themselves.
-+    bool mappedDirectOnly=frame.flipMapped&&frame.encoderTasks.empty();
++    // Encoder tasks may read the streaming buffers through Dawn, except the
++    // sprite pass tasks, which only touch their own targets.
++    bool streamTasks=false;
++    for(const auto& task:frame.encoderTasks) if(!flip_sprites::is_sprite_task(task.type)) {streamTasks=true;break;}
++    bool mappedDirectOnly=frame.flipMapped&&!streamTasks;
 +    if(mappedDirectOnly) for(const auto& pass:frame.renderPasses) {
 +      if(!pass.sealed||pass.discardable) continue;
 +      bool gxDraw=false;
@@ -704,6 +909,41 @@ index b3054be..8aa302a 100644
  void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
    copy_staging_to_high_water(cmd, frame, op);
    switch (op.type) {
+@@ -399,11 +662,34 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
+     break;
+   case FrameOpType::EncoderTask:
+     if (op.encoderTask != nullptr) {
++#ifdef MELEE_MIYOO_FLIP
++      flip_sprites::set_scene_view(frame.flipSurfaceView ? frame.flipSurfaceView : webgpu::g_frameBuffer.view);
++#endif
+       execute_encoder_task(cmd, frame, *op.encoderTask);
+     }
+     break;
+   }
+ }
++#ifdef MELEE_MIYOO_FLIP
++bool flip_scene_on_surface_enabled() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("MELEE_FLIP_SCENE_ON_SURFACE");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++}
++namespace {
++wgpu::Texture g_flipFrameSurfaceTexture;
++wgpu::TextureView g_flipFrameSurfaceView;
++} // namespace
++void set_flip_frame_surface(wgpu::Texture texture, wgpu::TextureView view) {
++  g_flipFrameSurfaceTexture = std::move(texture);
++  g_flipFrameSurfaceView = std::move(view);
++}
++std::pair<wgpu::Texture, wgpu::TextureView> take_flip_frame_surface() {
++  return {std::exchange(g_flipFrameSurfaceTexture, {}), std::exchange(g_flipFrameSurfaceView, {})};
++}
++#endif
+ } // namespace detail
+ 
+ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
 diff --git a/lib/gfx/encoding.hpp b/lib/gfx/encoding.hpp
 index 1b25b3d..01695a5 100644
 --- a/lib/gfx/encoding.hpp
@@ -720,10 +960,10 @@ index 1b25b3d..01695a5 100644
  
 diff --git a/lib/gfx/flip_gles.cpp b/lib/gfx/flip_gles.cpp
 new file mode 100644
-index 0000000..9c5233b
+index 0000000..b002481
 --- /dev/null
 +++ b/lib/gfx/flip_gles.cpp
-@@ -0,0 +1,1109 @@
+@@ -0,0 +1,1155 @@
 +#include "flip_gles.hpp"
 +
 +#ifdef MELEE_MIYOO_FLIP
@@ -779,6 +1019,7 @@ index 0000000..9c5233b
 +  std::string label;
 +  std::vector<PlanCommand> commands;
 +  uint32_t width=0,height=0;
++  uint32_t segmentStart=UINT32_MAX; // fused shadow pass: first command of the shifted segment
 +  bool eligible=false;
 +};
 +std::vector<PassPlan> sPlans;
@@ -850,6 +1091,7 @@ index 0000000..9c5233b
 +PipelineRef sLastPipeline=UINTPTR_MAX;
 +GLuint sLastVertexBuffer=Unknown; uint32_t sLastVertexOffset=UINT32_MAX,sLastVertexStride=UINT32_MAX;
 +GLuint sLastRecordBuffer=Unknown; uint32_t sLastRecordOffset=UINT32_MAX;
++GLuint sBindingDivisor=Unknown; // binding 0 step: 1 for instanced point sprites
 +// One vertex array object per attribute layout (MELEE_FLIP_LAYOUT_VAO=1,
 +// experiment, off by default): a layout switch becomes glBindVertexArray instead
 +// of ~10 attribute format calls and vertex-buffer binds drop 82 -> 21 per frame,
@@ -1053,7 +1295,7 @@ index 0000000..9c5233b
 +  bool cull=false; GLenum cullFace=0;
 +  bool depth=false; GLenum depthFunc=0; GLboolean depthMask=GL_FALSE;
 +  GLboolean colorMask[4]={GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE};
-+  bool blend=false; GLenum equation=0,src=0,dst=0,dstA=0,srcA=0; bool separate=false; float constantAlpha=-1.f;
++  bool blend=false; GLenum equation=0,src=0,dst=0,dstA=0,srcA=0; bool separate=false; bool accum=false; float constantAlpha=-1.f;
 +  bool polygonOffset=false; float slope=0,bias=0;
 +};
 +GLStateCache sGLState;
@@ -1075,7 +1317,8 @@ index 0000000..9c5233b
 +  if(depth&&(fresh||!st.depth||st.depthFunc!=depthFunc)) glDepthFunc(depthFunc);
 +  const GLboolean depthMask=c.depthCompare&&c.depthUpdate?GL_TRUE:GL_FALSE;
 +  if(fresh||st.depthMask!=depthMask) glDepthMask(depthMask);
-+  const GLboolean colorMask[4]={GLboolean(c.colorUpdate),GLboolean(c.colorUpdate),GLboolean(c.colorUpdate),GLboolean(c.alphaUpdate)};
++  const bool accum=(c.shaderConfig.flipFlags&gx::FlipSpriteAccum)!=0; // half-res sprite accumulation
++  const GLboolean colorMask[4]={GLboolean(c.colorUpdate),GLboolean(c.colorUpdate),GLboolean(c.colorUpdate),GLboolean(accum||c.alphaUpdate)};
 +  if(fresh||std::memcmp(st.colorMask,colorMask,4)) glColorMask(colorMask[0],colorMask[1],colorMask[2],colorMask[3]);
 +  GLenum src=GL_ONE,dst=GL_ZERO,equation=GL_FUNC_ADD;
 +  if(c.blendMode==GX_BM_BLEND) {src=blend_factor(c.blendFacSrc,false);dst=blend_factor(c.blendFacDst,true);}
@@ -1084,18 +1327,24 @@ index 0000000..9c5233b
 +    if(c.blendOp==GX_LO_CLEAR) src=dst=GL_ZERO;
 +    else if(c.blendOp==GX_LO_NOOP) {src=GL_ZERO;dst=GL_ONE;}
 +  }
-+  const bool blend=c.blendMode!=GX_BM_NONE||c.dstAlpha!=UINT32_MAX;
++  const bool blend=c.blendMode!=GX_BM_NONE||c.dstAlpha!=UINT32_MAX||accum;
++  if(accum&&c.blendMode==GX_BM_NONE) {src=GL_SRC_ALPHA;dst=GL_ZERO;} // premultiplied store
 +  if(fresh||st.blend!=blend) { if(blend) glEnable(GL_BLEND); else glDisable(GL_BLEND); }
 +  if(blend) {
 +    if(fresh||!st.blend||st.equation!=equation) glBlendEquationSeparate(equation,equation);
 +    if(c.dstAlpha!=UINT32_MAX) {
 +      const float constantAlpha=c.dstAlpha/255.f;
 +      if(fresh||st.constantAlpha!=constantAlpha) glBlendColor(0,0,0,constantAlpha);
-+      if(fresh||!st.blend||!st.separate||st.src!=src||st.dst!=dst) glBlendFuncSeparate(src,dst,GL_CONSTANT_ALPHA,GL_ZERO);
-+      st.separate=true; st.constantAlpha=constantAlpha;
++      if(fresh||!st.blend||!st.separate||st.accum||st.src!=src||st.dst!=dst) glBlendFuncSeparate(src,dst,GL_CONSTANT_ALPHA,GL_ZERO);
++      st.separate=true; st.accum=false; st.constantAlpha=constantAlpha;
++    } else if(accum) {
++      const bool opaque=c.blendMode==GX_BM_NONE, attenuates=dst==GL_ONE_MINUS_SRC_ALPHA;
++      if(fresh||!st.blend||!st.separate||!st.accum||st.src!=src||st.dst!=dst)
++        glBlendFuncSeparate(src,dst,opaque||attenuates?GL_ONE:GL_ZERO,opaque?GL_ZERO:attenuates?GL_ONE_MINUS_SRC_ALPHA:GL_ONE);
++      st.separate=true; st.accum=true;
 +    } else {
 +      if(fresh||!st.blend||st.separate||st.src!=src||st.dst!=dst) glBlendFunc(src,dst);
-+      st.separate=false;
++      st.separate=false; st.accum=false;
 +    }
 +    st.equation=equation; st.src=src; st.dst=dst;
 +  }
@@ -1359,6 +1608,7 @@ index 0000000..9c5233b
 +        glBindVertexArray(v.vao);
 +        set_layout();
 +      } else glBindVertexArray(v.vao);
++      sBindingDivisor=Unknown; // per-VAO state
 +      if(v.ebo!=sPassEbo) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,sPassEbo); v.ebo=sPassEbo; }
 +      sCurrentVao=&v; sLastLayout=used; ++sGlCalls.layouts;
 +    }
@@ -1388,6 +1638,9 @@ index 0000000..9c5233b
 +  sLastLayout=used; ++sGlCalls.layouts;
 +  }
 +  }
++  // Instanced point sprites step binding 0 per instance (one record per point).
++  const GLuint divisor=(p.config.shaderConfig.flipFlags&gx::FlipInstancedPoints)?1u:0u;
++  if(!cache_enabled()||sBindingDivisor!=divisor) { glVertexBindingDivisor(0,divisor); sBindingDivisor=divisor; }
 +  }
 +
 +  flip_profile::Scope immediateProfile("gl_immediates");
@@ -1530,6 +1783,15 @@ index 0000000..9c5233b
 +    std::fprintf(stderr,"[flip-direct] frame=%llu pass=%u mode=%d commands=%zu target=%u\n",
 +                 static_cast<unsigned long long>(sFrameNumber),passIndex,mode,
 +                 plan.commands.size(),target.texture?target.texture:target.renderbuffer);
++  const auto reset_memos=[] {
++    sLastProgram=sLastUniform=sLastUniformBinding=sLastLayout=Unknown;
++    sLastUniformOffset=Unknown;
++    sLastPipeline=UINTPTR_MAX;sTextureState={};
++    sGLState=GLStateCache{};sActiveUnit=Unknown;
++    sLastVertexBuffer=Unknown;sLastVertexOffset=sLastVertexStride=UINT32_MAX;
++    sLastRecordBuffer=Unknown;sLastRecordOffset=UINT32_MAX;sBindingDivisor=Unknown;
++    for(auto& [ref,prepared]:sPrepared) prepared.lastImmediatePad=UINT32_MAX;
++  };
 +  if(mode>=2) {
 +    if(!sVao) glGenVertexArrays(1,&sVao);
 +    glBindVertexArray(sVao);
@@ -1537,19 +1799,38 @@ index 0000000..9c5233b
 +        dawn::native::opengl::GetDirectGLBuffer(resources().indexBuffer.Get());
 +    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,sPassEbo);
 +    sCurrentVao=nullptr; // Dawn may have changed VAO/buffer state between passes
-+    sLastProgram=sLastUniform=sLastUniformBinding=sLastLayout=Unknown;
-+    sLastUniformOffset=Unknown;
-+    sLastPipeline=UINTPTR_MAX;sTextureState={};
-+    sGLState=GLStateCache{};sActiveUnit=Unknown;
-+    sLastVertexBuffer=Unknown;sLastVertexOffset=sLastVertexStride=UINT32_MAX;
-+    sLastRecordBuffer=Unknown;sLastRecordOffset=UINT32_MAX;
-+    for(auto& [ref,prepared]:sPrepared) prepared.lastImmediatePad=UINT32_MAX;
++    reset_memos();
 +    glEnable(GL_SCISSOR_TEST);
 +    glDisable(GL_STENCIL_TEST);
++    // Diagnostic: MELEE_FLIP_DUMP_EFB_PASS=<frame> writes the EFB as this pass
++    // starts (before its draws) to data/diagnostics/efb-dump-f<frame>-p<pass>.ppm.
++    static const long dumpFrame=[] {const char* v=std::getenv("MELEE_FLIP_DUMP_EFB_PASS");return v?std::atol(v):-1;}();
++    if(dumpFrame>=0&&static_cast<long>(sFrameNumber)==dumpFrame&&(target.texture||target.renderbuffer)) {
++      GLint drawFbo=0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&drawFbo);
++      GLuint fbo=0; glGenFramebuffers(1,&fbo); glBindFramebuffer(GL_READ_FRAMEBUFFER,fbo);
++      if(target.texture) glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,target.texture,0);
++      else glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_RENDERBUFFER,target.renderbuffer);
++      std::vector<uint8_t> pixels(size_t(plan.width)*plan.height*4);
++      glReadPixels(0,0,plan.width,plan.height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
++      const GLenum err=glGetError();
++      glBindFramebuffer(GL_READ_FRAMEBUFFER,GLuint(drawFbo)); glDeleteFramebuffers(1,&fbo);
++      char path[128]; std::snprintf(path,sizeof(path),"data/diagnostics/efb-dump-f%ld-p%u.ppm",dumpFrame,passIndex);
++      if(FILE* f=std::fopen(path,"wb")) {
++        std::fprintf(f,"P6\n%u %u\n255\n",plan.width,plan.height);
++        for(uint32_t y=0;y<plan.height;++y) for(uint32_t x=0;x<plan.width;++x) std::fwrite(&pixels[(size_t(y)*plan.width+x)*4],1,3,f);
++        std::fclose(f);
++      }
++      std::fprintf(stderr,"[flip-efb-dump] frame=%ld pass=%u file=%s gl-error=%u\n",dumpFrame,passIndex,path,err);
++    }
 +    gl_ok("pass-state",passIndex,0);
 +  }
 +  uint32_t drawIndex=0;
-+  for(const auto& command:plan.commands) {
++  // Diagnostic/safety: MELEE_FLIP_FUSE_RESET=1 treats the shifted segment of a
++  // fused shadow pass like a pass start for the state memos.
++  static const bool fuseReset=[] {const char* v=std::getenv("MELEE_FLIP_FUSE_RESET");return v&&std::strcmp(v,"0");}();
++  for(size_t commandIndex=0;commandIndex<plan.commands.size();++commandIndex) {
++    const auto& command=plan.commands[commandIndex];
++    if(fuseReset&&mode>=2&&commandIndex==plan.segmentStart) reset_memos();
 +    if(command.type==CommandType::SetViewport) {
 +      if(mode<2) continue;
 +      const auto& v=command.viewport;
@@ -1593,6 +1874,10 @@ index 0000000..9c5233b
 +  static const bool enabled=[] {const char* v=std::getenv("MELEE_FLIP_DIRECT_PACKET");return v&&std::strcmp(v,"0");}();
 +  if(!enabled||direct_mode()<5||pass.msaaSamples!=1||pass.colorAttachmentCount!=1||
 +     !gx::flip_vertex_enabled()||!gx::flip_uniform_windows_enabled()) return false;
++  // Diagnostic: MELEE_FLIP_FUSE_DAWN=1 leaves fused shadow passes (two resolves)
++  // to Dawn's reference renderer while every other pass stays direct.
++  static const bool fusedViaDawn=[] {const char* v=std::getenv("MELEE_FLIP_FUSE_DAWN");return v&&std::strcmp(v,"0");}();
++  if(fusedViaDawn&&!pass.flipExtraResolves.empty()) return false;
 +  std::unordered_set<PipelineRef> seenPipelines;
 +  std::vector<wgpu::RenderPipeline> pipelines;
 +  std::unordered_set<uint64_t> textures;
@@ -1687,6 +1972,7 @@ index 0000000..9c5233b
 +                  .label=pass.flipDirectLabel,
 +                  .width=pass.colorAttachments[0].size.width,
 +                  .height=pass.colorAttachments[0].size.height,
++                  .segmentStart=pass.flipSegmentStart,
 +                  .eligible=pass.msaaSamples==1&&pass.colorAttachmentCount==1&&
 +                            gx::flip_vertex_enabled()&&gx::flip_uniform_windows_enabled()};
 +    bool hasGxDraw=false;
@@ -1835,10 +2121,10 @@ index 0000000..9c5233b
 +#endif
 diff --git a/lib/gfx/flip_gles.hpp b/lib/gfx/flip_gles.hpp
 new file mode 100644
-index 0000000..336f59c
+index 0000000..713c602
 --- /dev/null
 +++ b/lib/gfx/flip_gles.hpp
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,26 @@
 +#pragma once
 +
 +#ifdef MELEE_MIYOO_FLIP
@@ -1856,6 +2142,11 @@ index 0000000..336f59c
 +// attached target. Falls back to the recorded pass when the blit is unavailable.
 +void flip_request_present_blit(const wgpu::TextureView& source, uint32_t width, uint32_t height);
 +bool flip_present_blit_enabled();
++// Scene-on-surface (MELEE_FLIP_SCENE_ON_SURFACE, default on): EFB passes
++// render into the frame's presented texture; the present copy pass is skipped.
++bool flip_scene_on_surface_enabled();
++void set_flip_frame_surface(wgpu::Texture texture, wgpu::TextureView view);
++std::pair<wgpu::Texture, wgpu::TextureView> take_flip_frame_surface();
 +void uninstall_flip_gles_frame();
 +void shutdown_flip_gles();
 +}
@@ -1943,6 +2234,293 @@ index 0000000..e75fb20
 +    std::fprintf(stderr,"[flip-pattern] frame=%llu lane=%s %s\n",(unsigned long long)state.frame,state.lane,pattern.c_str());
 +}
 +}
+diff --git a/lib/gfx/flip_sprites.cpp b/lib/gfx/flip_sprites.cpp
+new file mode 100644
+index 0000000..e69e853
+--- /dev/null
++++ b/lib/gfx/flip_sprites.cpp
+@@ -0,0 +1,252 @@
++#include "flip_sprites.hpp"
++
++#include "frame.hpp"
++#include "../webgpu/gpu.hpp"
++#include "../webgpu/gpu_prof.hpp"
++
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace aurora::gfx::flip_sprites {
++using webgpu::g_device;
++
++bool enabled() noexcept { return threshold() != 0; }
++uint32_t threshold() noexcept {
++  static const uint32_t value = [] {
++    const char* v = std::getenv("MELEE_FLIP_HALFRES_SPRITES");
++    // Default 4000 points: only sprite-heavy frames (Fountain of Dreams) take
++    // the pass. With the atlas and the reflection skip it is a net gain there
++    // (v142: mean frame 26.6 -> 23.9 ms, p95 50 -> 36 ms); 0 disables.
++    return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 4000u;
++  }();
++  return value;
++}
++
++namespace {
++std::mutex g_mutex;
++webgpu::TextureWithSampler g_color;
++webgpu::TextureWithSampler g_depth;
++wgpu::TextureView g_sceneView;
++wgpu::RenderPipeline g_prepPipeline, g_compositePipeline;
++wgpu::BindGroupLayout g_prepLayout, g_compositeLayout;
++wgpu::Sampler g_linearSampler;
++EncoderTaskId g_prepTask = InvalidEncoderTask, g_compositeTask = InvalidEncoderTask;
++
++constexpr const char* PrepShader = R"(
++@group(0) @binding(0) var scene_depth: texture_depth_2d;
++var<private> positions: array<vec2f, 3> = array(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
++@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
++    return vec4f(positions[vi], 0.0, 1.0);
++}
++struct Out { @builtin(frag_depth) depth: f32, @location(0) color: vec4f };
++@fragment fn fs_main(@builtin(position) pos: vec4f) -> Out {
++    let size = vec2i(textureDimensions(scene_depth));
++    let coord = clamp(vec2i(pos.xy) * 2, vec2i(0), size - vec2i(1));
++    var out: Out;
++    out.depth = textureLoad(scene_depth, coord, 0);
++    out.color = vec4f(0.0);
++    return out;
++}
++)";
++constexpr const char* CompositeShader = R"(
++@group(0) @binding(0) var samp: sampler;
++@group(0) @binding(1) var sprites: texture_2d<f32>;
++struct VertexOutput { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
++var<private> positions: array<vec2f, 3> = array(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
++var<private> uvs: array<vec2f, 3> = array(vec2f(0.0, 0.0), vec2f(0.0, 2.0), vec2f(2.0, 0.0));
++@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
++    var out: VertexOutput;
++    out.pos = vec4f(positions[vi], 0.0, 1.0);
++    out.uv = uvs[vi];
++    return out;
++}
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    return textureSample(sprites, samp, in.uv);
++}
++)";
++
++wgpu::ShaderModule make_module(const char* source, const char* label) {
++  const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = source}};
++  const wgpu::ShaderModuleDescriptor desc{.nextInChain = &wgsl, .label = label};
++  return g_device.CreateShaderModule(&desc);
++}
++
++void ensure_pipelines() {
++  if (g_prepPipeline) return;
++  const auto colorFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
++  {
++    const std::array entries{wgpu::BindGroupLayoutEntry{
++        .binding = 0,
++        .visibility = wgpu::ShaderStage::Fragment,
++        .texture = {.sampleType = wgpu::TextureSampleType::Depth, .viewDimension = wgpu::TextureViewDimension::e2D},
++    }};
++    const wgpu::BindGroupLayoutDescriptor layoutDesc{.label = "Sprite prep layout", .entryCount = entries.size(), .entries = entries.data()};
++    g_prepLayout = g_device.CreateBindGroupLayout(&layoutDesc);
++    const auto module = make_module(PrepShader, "Sprite prep");
++    const std::array targets{wgpu::ColorTargetState{.format = colorFormat, .writeMask = wgpu::ColorWriteMask::None}};
++    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = targets.size(), .targets = targets.data()};
++    const wgpu::DepthStencilState depth{
++        .format = webgpu::g_graphicsConfig.depthFormat,
++        .depthWriteEnabled = true,
++        .depthCompare = wgpu::CompareFunction::Always,
++    };
++    const wgpu::PipelineLayoutDescriptor plDesc{.bindGroupLayoutCount = 1, .bindGroupLayouts = &g_prepLayout};
++    const auto pipelineLayout = g_device.CreatePipelineLayout(&plDesc);
++    const wgpu::RenderPipelineDescriptor desc{
++        .label = "Sprite prep",
++        .layout = pipelineLayout,
++        .vertex = {.module = module, .entryPoint = "vs_main"},
++        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
++        .depthStencil = &depth,
++        .fragment = &fragment,
++    };
++    g_prepPipeline = g_device.CreateRenderPipeline(&desc);
++  }
++  {
++    const std::array entries{
++        wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment, .sampler = {.type = wgpu::SamplerBindingType::Filtering}},
++        wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Fragment,
++                                   .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D}},
++    };
++    const wgpu::BindGroupLayoutDescriptor layoutDesc{.label = "Sprite composite layout", .entryCount = entries.size(), .entries = entries.data()};
++    g_compositeLayout = g_device.CreateBindGroupLayout(&layoutDesc);
++    const auto module = make_module(CompositeShader, "Sprite composite");
++    // EFB' = sprites.rgb + EFB * (1 - coverage); EFB alpha untouched.
++    static const wgpu::BlendState blend{
++        .color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One, .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
++        .alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::Zero, .dstFactor = wgpu::BlendFactor::One},
++    };
++    const std::array targets{wgpu::ColorTargetState{
++        .format = colorFormat,
++        .blend = &blend,
++        .writeMask = wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue,
++    }};
++    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = targets.size(), .targets = targets.data()};
++    const wgpu::PipelineLayoutDescriptor plDesc{.bindGroupLayoutCount = 1, .bindGroupLayouts = &g_compositeLayout};
++    const auto pipelineLayout = g_device.CreatePipelineLayout(&plDesc);
++    const wgpu::RenderPipelineDescriptor desc{
++        .label = "Sprite composite",
++        .layout = pipelineLayout,
++        .vertex = {.module = module, .entryPoint = "vs_main"},
++        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
++        .fragment = &fragment,
++    };
++    g_compositePipeline = g_device.CreateRenderPipeline(&desc);
++    const wgpu::SamplerDescriptor samplerDesc{
++        .label = "Sprite composite sampler",
++        .addressModeU = wgpu::AddressMode::ClampToEdge,
++        .addressModeV = wgpu::AddressMode::ClampToEdge,
++        .magFilter = wgpu::FilterMode::Linear,
++        .minFilter = wgpu::FilterMode::Linear,
++    };
++    g_linearSampler = g_device.CreateSampler(&samplerDesc);
++  }
++}
++
++void prep(const EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void*, size_t, void*) {
++  ensure_pipelines();
++  webgpu::TextureWithSampler color, depth;
++  {
++    std::lock_guard lock{g_mutex};
++    color = g_color;
++    depth = g_depth;
++  }
++  if (!color.view || !depth.view || !webgpu::g_depthBuffer.view) return;
++  const std::array entries{wgpu::BindGroupEntry{.binding = 0, .textureView = webgpu::g_depthBuffer.view}};
++  const wgpu::BindGroupDescriptor bgDesc{.layout = g_prepLayout, .entryCount = entries.size(), .entries = entries.data()};
++  const auto bindGroup = g_device.CreateBindGroup(&bgDesc);
++  const std::array attachments{wgpu::RenderPassColorAttachment{
++      .view = color.view, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Store, .clearValue = {0.0, 0.0, 0.0, 0.0}}};
++  const wgpu::RenderPassDepthStencilAttachment depthAttachment{
++      .view = depth.view,
++      .depthLoadOp = wgpu::LoadOp::Clear,
++      .depthStoreOp = wgpu::StoreOp::Store,
++      .depthClearValue = 1.f,
++  };
++  const wgpu::RenderPassDescriptor passDesc{
++      .label = "Sprite prep pass",
++      .colorAttachmentCount = attachments.size(),
++      .colorAttachments = attachments.data(),
++      .depthStencilAttachment = &depthAttachment,
++      .timestampWrites = webgpu::gpu_prof::pass_writes("Sprite prep"),
++  };
++  const auto pass = cmd.BeginRenderPass(&passDesc);
++  pass.SetPipeline(g_prepPipeline);
++  pass.SetBindGroup(0, bindGroup);
++  pass.Draw(3);
++  pass.End();
++}
++
++void composite(const EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void*, size_t, void*) {
++  ensure_pipelines();
++  webgpu::TextureWithSampler color;
++  {
++    std::lock_guard lock{g_mutex};
++    color = g_color;
++  }
++  const wgpu::TextureView scene = g_sceneView ? g_sceneView : webgpu::g_frameBuffer.view;
++  if (!color.view || !scene) return;
++  const std::array entries{
++      wgpu::BindGroupEntry{.binding = 0, .sampler = g_linearSampler},
++      wgpu::BindGroupEntry{.binding = 1, .textureView = color.view},
++  };
++  const wgpu::BindGroupDescriptor bgDesc{.layout = g_compositeLayout, .entryCount = entries.size(), .entries = entries.data()};
++  const auto bindGroup = g_device.CreateBindGroup(&bgDesc);
++  const std::array attachments{wgpu::RenderPassColorAttachment{.view = scene, .loadOp = wgpu::LoadOp::Load, .storeOp = wgpu::StoreOp::Store}};
++  const wgpu::RenderPassDescriptor passDesc{
++      .label = "Sprite composite pass",
++      .colorAttachmentCount = attachments.size(),
++      .colorAttachments = attachments.data(),
++      .timestampWrites = webgpu::gpu_prof::pass_writes("Sprite composite"),
++  };
++  const auto pass = cmd.BeginRenderPass(&passDesc);
++  pass.SetPipeline(g_compositePipeline);
++  pass.SetBindGroup(0, bindGroup);
++  pass.Draw(3);
++  pass.End();
++}
++
++void ensure_targets() {
++  const auto& efb = webgpu::g_frameBuffer;
++  const uint32_t width = std::max(efb.size.width / 2, 1u), height = std::max(efb.size.height / 2, 1u);
++  std::lock_guard lock{g_mutex};
++  if (g_color.view && g_color.size.width == width && g_color.size.height == height) return;
++  g_color = webgpu::create_render_texture(width, height, false);
++  const wgpu::TextureDescriptor depthDesc{
++      .label = "Sprite depth",
++      .usage = wgpu::TextureUsage::RenderAttachment,
++      .dimension = wgpu::TextureDimension::e2D,
++      .size = {width, height, 1},
++      .format = webgpu::g_graphicsConfig.depthFormat,
++      .mipLevelCount = 1,
++      .sampleCount = 1,
++  };
++  auto texture = g_device.CreateTexture(&depthDesc);
++  auto view = texture.CreateView();
++  g_depth = {.texture = std::move(texture), .view = std::move(view), .size = {width, height, 1}, .format = webgpu::g_graphicsConfig.depthFormat};
++}
++} // namespace
++
++const webgpu::TextureWithSampler& color_target() {
++  ensure_targets();
++  return g_color;
++}
++const webgpu::TextureWithSampler& depth_target() {
++  ensure_targets();
++  return g_depth;
++}
++EncoderTaskId prep_task() {
++  if (g_prepTask == InvalidEncoderTask) g_prepTask = register_encoder_task_type({.label = "Sprite prep", .callback = prep});
++  return g_prepTask;
++}
++EncoderTaskId composite_task() {
++  if (g_compositeTask == InvalidEncoderTask)
++    g_compositeTask = register_encoder_task_type({.label = "Sprite composite", .callback = composite});
++  return g_compositeTask;
++}
++void set_scene_view(wgpu::TextureView view) { g_sceneView = std::move(view); }
++bool is_sprite_task(EncoderTaskId type) noexcept {
++  return type != InvalidEncoderTask && (type == g_prepTask || type == g_compositeTask);
++}
++} // namespace aurora::gfx::flip_sprites
+diff --git a/lib/gfx/flip_sprites.hpp b/lib/gfx/flip_sprites.hpp
+new file mode 100644
+index 0000000..0b5d984
+--- /dev/null
++++ b/lib/gfx/flip_sprites.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++// Half-resolution sprite pass (Miyoo Flip). Fountain of Dreams draws ~25k
++// blended point sprites that cost ~8 ms of GPU fill at 640x480. When a frame
++// draws more than MELEE_FLIP_HALFRES_SPRITES points (default 4000; 0 disables),
++// runs of eligible point draws render into a 320x240 target with a downsampled
++// scene depth and are composited back with premultiplied alpha.
++#include "../webgpu/gpu.hpp"
++#include "aurora/gfx.hpp"
++
++namespace aurora::gfx::flip_sprites {
++bool enabled() noexcept;
++uint32_t threshold() noexcept;
++// Half-res color/depth targets sized to the current EFB (created on demand).
++const webgpu::TextureWithSampler& color_target();
++const webgpu::TextureWithSampler& depth_target();
++// Encoder tasks: prepare (clear color, downsample the scene depth) and composite.
++EncoderTaskId prep_task();
++EncoderTaskId composite_task();
++// True for the two sprite tasks (they never read the streaming buffers).
++bool is_sprite_task(EncoderTaskId type) noexcept;
++// The scene color view the composite draws onto (set per frame op by the encoder).
++void set_scene_view(wgpu::TextureView view);
++} // namespace aurora::gfx::flip_sprites
 diff --git a/lib/gfx/flip_stream.hpp b/lib/gfx/flip_stream.hpp
 new file mode 100644
 index 0000000..fbf1a7c
@@ -2112,7 +2690,7 @@ index 0000000..967c8a7
 +}
 +} // namespace aurora::gfx::detail
 diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
-index 9fd83ef..71ee184 100644
+index 9fd83ef..14a52cb 100644
 --- a/lib/gfx/frame.cpp
 +++ b/lib/gfx/frame.cpp
 @@ -1,4 +1,16 @@
@@ -2543,7 +3121,7 @@ index 9fd83ef..71ee184 100644
  void end_frame(EndFrameCallback callback) {
    ZoneScoped;
    if (g_cpuFrameStart.time_since_epoch().count() != 0) {
-@@ -672,9 +999,62 @@ void end_frame(EndFrameCallback callback) {
+@@ -672,9 +999,63 @@ void end_frame(EndFrameCallback callback) {
  
    const size_t stagingSlot = frame.stagingBuffer;
    render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
@@ -2574,6 +3152,7 @@ index 9fd83ef..71ee184 100644
 +    upload_flip_geometry(packet);
 +    const auto afterUpload = std::chrono::steady_clock::now();
 +    prepare_flip_gles_frame(packet);
++    set_flip_frame_surface(std::move(packet.flipSurfaceTexture), std::move(packet.flipSurfaceView));
 +    const auto afterPrepare = std::chrono::steady_clock::now();
 +    if (phaseProfile) {
 +      static double uploadMs = 0, prepareMs = 0, callbackMs = 0; static unsigned frames = 0;
@@ -2607,7 +3186,7 @@ index 9fd83ef..71ee184 100644
      auto encoder = std::move(packet.encoder);
      const auto stats = packet.stats;
      auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
-@@ -691,7 +1071,7 @@ void end_frame(EndFrameCallback callback) {
+@@ -691,7 +1072,7 @@ void end_frame(EndFrameCallback callback) {
      }
      g_frameSlots.release(frameSlot);
      expire_cached_bind_groups();
@@ -2673,7 +3252,7 @@ index 0b86ffe..19314c6 100644
  void after_submit() noexcept;
  void gpu_synchronize();
 diff --git a/lib/gfx/frame_packet.hpp b/lib/gfx/frame_packet.hpp
-index d50ce6a..f6287c9 100644
+index d50ce6a..9f31962 100644
 --- a/lib/gfx/frame_packet.hpp
 +++ b/lib/gfx/frame_packet.hpp
 @@ -12,6 +12,9 @@
@@ -2686,18 +3265,30 @@ index d50ce6a..f6287c9 100644
  namespace aurora::gfx::detail {
  
  struct StagingHighWater {
-@@ -104,6 +107,10 @@ struct RenderPass {
+@@ -104,6 +107,22 @@ struct RenderPass {
    bool discardable = false;
    bool captureDepthSnapshot = false;
    bool sealed = false;
 +#ifdef MELEE_MIYOO_FLIP
 +  std::string flipDirectLabel;
 +  bool flipDirectResourcesOnly = false;
++  // Additional EFB copies resolved from this pass (shadow-pass fusion records a
++  // second shadow map into the same pass, shifted right of the first copy).
++  struct FlipResolve {
++    TextureHandle target;
++    GXTexFmt format = GX_TF_RGBA8;
++    ClipRect rect{};
++    Range uniformRange{};
++  };
++  std::vector<FlipResolve> flipExtraResolves;
++  uint8_t flipWriteMask = 0; // channels written by recorded GX draws: 1 color, 2 alpha, 4 depth
++  uint32_t flipSegmentStart = UINT32_MAX; // first command of a fused (shifted) shadow segment
++  Range flipDualResolveUniform{}; // both UV transforms for a two-target conversion pass
 +#endif
    std::vector<tex_palette_conv::ConvRequest> paletteConvs;
  
    RenderTargetLayout target_layout() const noexcept;
-@@ -192,6 +199,22 @@ struct FramePacket {
+@@ -192,6 +211,28 @@ struct FramePacket {
  #endif
    ByteBuffer verts;
    ByteBuffer uniforms;
@@ -2707,6 +3298,12 @@ index d50ce6a..f6287c9 100644
 +  std::vector<Range> flipOrdinaryUniforms;
 +  // Uniforms/indices were recorded straight into persistently mapped GL storage.
 +  bool flipMapped = false;
++  // Scene-on-surface: the presented texture acquired when this frame's first
++  // EFB pass was encoded; EFB passes render into it and the present copy is
++  // skipped (MELEE_FLIP_SCENE_ON_SURFACE).
++  wgpu::Texture flipSurfaceTexture;
++  wgpu::TextureView flipSurfaceView;
++  bool flipSurfaceTried = false;
 +  // Per-frame uniform-record stream for resident geometry: one u32 per arena
 +  // vertex, located in `verts` at flipRecordOffset; arena i starts at vertex
 +  // flipRecordArenaBase[i] and covers flipRecordArenaCount[i] vertices.
@@ -2720,7 +3317,7 @@ index d50ce6a..f6287c9 100644
    ByteBuffer indices;
    ByteBuffer storage;
    ByteBuffer textureUpload;
-@@ -204,4 +227,9 @@ struct FramePacket {
+@@ -204,4 +245,9 @@ struct FramePacket {
    AuroraStats stats{};
  };
  
@@ -2846,10 +3443,10 @@ index 7eb4723..52f638e 100644
  
  } // namespace aurora::gfx
 diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
-index d04db0f..1f6494a 100644
+index d04db0f..181e978 100644
 --- a/lib/gfx/recording.cpp
 +++ b/lib/gfx/recording.cpp
-@@ -13,6 +13,11 @@
+@@ -13,12 +13,21 @@
  #include "../gx/fifo.hpp"
  #include "../gx/gx.hpp"
  #include "../gx/pipeline.hpp"
@@ -2857,12 +3454,636 @@ index d04db0f..1f6494a 100644
 +#include "../gx/flip_uber.hpp"
 +#include "../gx/flip_resident.hpp"
 +#include "flip_profile.hpp"
++#include "flip_sprites.hpp"
 +#endif
  #ifdef AURORA_ENABLE_RMLUI
  #include "../rmlui/pipeline.hpp"
  #endif
-@@ -522,6 +527,12 @@ void enqueue_op(FramePacket& frame, uint32_t opIndex) {
+ #include "../window.hpp"
  
+ #include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <new>
+ #include <optional>
+@@ -26,6 +35,7 @@
+ #include <string>
+ #include <type_traits>
+ #include <utility>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include <absl/container/flat_hash_map.h>
+@@ -35,6 +45,9 @@
+ namespace aurora::gfx {
+ using namespace detail;
+ 
++template <>
++PipelineRef pipeline_ref(const clear::PipelineConfig& config);
++
+ namespace {
+ constexpr Module Log{"aurora::gfx"};
+ 
+@@ -69,6 +82,95 @@ struct FrameRecorder {
+ 
+ FrameRecorder g_recorder;
+ 
++#ifdef MELEE_MIYOO_FLIP
++// Shadow-pass fusion (MELEE_FLIP_FUSE_PASSES, default on). Melee renders its
++// two 256x256 shadow maps as separate EFB passes, each ending in an EFB copy
++// with a full clear; on the Mali blob every render pass costs ~0.5 ms of driver
++// time. The second shadow is therefore recorded into the same pass with its
++// viewport and scissor shifted right of the first copy rectangle, and the pass
++// carries two resolves. The fusion is speculative: anything that could change
++// the image (a viewport that does not fit, a clear or custom draw, a draw that
++// samples the first copy, a palette conversion, any other pass break) splits
++// the shifted segment back out into its own pass with its coordinates restored.
++struct FlipPassFusion {
++  bool active = false;
++  uint32_t pass = UINT32_MAX;
++  size_t segmentStart = 0;
++  int32_t offsetX = 0;
++  TextureHandle firstTarget;
++  Vec4<float> clearColorValue{};
++  float clearDepthValue = 1.f;
++  // Clear flags of the first copy (they shape the pass a split has to recreate)
++  // and the channels (1 color, 2 alpha, 4 depth) written by each segment.
++  bool clearColor1 = false, clearAlpha1 = false, clearDepth1 = false;
++  uint8_t firstWrites = 0;
++  uint8_t segmentWrites = 0;
++  struct Stats {
++    unsigned frames = 0, fused = 0, refused = 0, split = 0;
++    unsigned refuseClear = 0, refuseState = 0, refuseRegion = 0, refuseRoom = 0, refuseDraws = 0;
++    unsigned splitViewport = 0, splitScissor = 0, splitClear = 0, splitCustom = 0, splitTexture = 0, splitBreak = 0,
++             splitSecond = 0, splitPalette = 0;
++  } stats;
++};
++FlipPassFusion g_fusion;
++
++bool flip_fuse_enabled() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("MELEE_FLIP_FUSE_PASSES");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++}
++bool flip_fuse_trace() {
++  static const bool trace = [] {
++    const char* v = std::getenv("MELEE_FLIP_FUSE_TRACE");
++    return v != nullptr && std::strcmp(v, "0") != 0;
++  }();
++  return trace;
++}
++// Channels the current GX state lets a draw write (matches the pipeline's
++// write mask and depthWriteEnabled = depthCompare && depthUpdate).
++uint8_t flip_current_write_mask() {
++  return (gx::g_gxState.colorUpdate ? 1u : 0u) | (gx::g_gxState.alphaUpdate ? 2u : 0u) |
++         (gx::g_gxState.depthCompare && gx::g_gxState.depthUpdate ? 4u : 0u);
++}
++void flip_fusion_split(const char* reason, unsigned& counter);
++void flip_fusion_settle(const char* reason, unsigned& counter);
++// Small color EFB copies (Fountain of Dreams renders the fighters a second time
++// for its 80x60 water reflection: ~150 draws, ~4.7 ms of render-worker time).
++// With MELEE_FLIP_SCALED_COPY_INTERVAL=N (default 2) such a pass is rendered every
++// Nth frame and the copy texture keeps its previous content in between: the
++// pass is dropped before it reaches the render worker.
++struct FlipScaledCopySkip {
++  uint64_t frame = 0;
++  std::unordered_set<const TextureRef*> rendered; // targets that hold a valid image
++  unsigned skipped = 0, rendered_count = 0;
++};
++FlipScaledCopySkip g_scaledCopies;
++unsigned flip_scaled_copy_interval() {
++  static const unsigned interval = [] {
++    const char* v = std::getenv("MELEE_FLIP_SCALED_COPY_INTERVAL");
++    const long n = v ? std::atol(v) : 2;
++    return n < 1 ? 1u : static_cast<unsigned>(n);
++  }();
++  return interval;
++}
++// Half-res sprite segment state (see flip_sprites.hpp).
++struct FlipSpriteSegment {
++  bool active = false;
++  uint32_t framePoints = 0, prevFramePoints = 0;
++  Viewport savedViewport{};
++  ClipRect savedScissor{};
++  struct Stats { unsigned frames = 0, segments = 0, points = 0, refused = 0; } stats;
++};
++FlipSpriteSegment g_sprites;
++void flip_sprite_end_segment();
++inline void flip_sprite_settle_impl() { if (g_sprites.active) flip_sprite_end_segment(); }
++#define FLIP_FUSION_SETTLE(reason, counter) (flip_sprite_settle_impl(), flip_fusion_settle(reason, g_fusion.stats.counter))
++#else
++#define FLIP_FUSION_SETTLE(reason, counter) ((void)0)
++#endif
++
+ std::string pass_label(std::string_view kind) {
+ #ifdef AURORA_GFX_DEBUG_GROUPS
+   if (!g_recorder.debugGroupStack.empty()) {
+@@ -288,18 +390,79 @@ void push_command(CommandType type, const Command::Data& data) {
+       Log.warn("Dropping command {}", magic_enum::enum_name(type));
+       return;
+     }
++#ifdef MELEE_MIYOO_FLIP
++  Command::Data shifted{.setViewport = {}};
++  const Command::Data* payload = &data;
++  if (g_fusion.active) {
++    // Commands of the shifted segment of a fused pass: move viewport and scissor
++    // right of the first copy, or give up the fusion if they cannot fit.
++    const auto efbWidth =
++        static_cast<int32_t>(current_render_passes()[g_fusion.pass].colorAttachments[SceneColorAttachmentIndex].size.width);
++    if (type == CommandType::SetViewport) {
++      const auto& vp = data.setViewport;
++      if (vp.left < 0.f || static_cast<int32_t>(std::ceil(vp.left + vp.width)) + g_fusion.offsetX > efbWidth) {
++        flip_fusion_split("viewport", g_fusion.stats.splitViewport);
++      } else {
++        shifted = data;
++        shifted.setViewport.left += static_cast<float>(g_fusion.offsetX);
++        payload = &shifted;
++      }
++    } else if (type == CommandType::SetScissor) {
++      if (data.setScissor.x < 0) {
++        flip_fusion_split("scissor", g_fusion.stats.splitScissor);
++      } else {
++        shifted = data;
++        shifted.setScissor.x += g_fusion.offsetX;
++        payload = &shifted;
++      }
++    } else if (type == CommandType::CustomDraw) {
++      flip_fusion_split("custom", g_fusion.stats.splitCustom);
++    } else if (type == CommandType::Draw) {
++      clear::DrawData clearDraw;
++      if (!decode_flip_clear_draw(data.draw, clearDraw)) {
++        g_fusion.segmentWrites |= flip_current_write_mask();
++      }
++    }
++  }
++  if (g_sprites.active) {
++    // Half-res sprite pass: viewport and scissor at half scale.
++    if (type == CommandType::SetViewport) {
++      shifted = *payload;
++      auto& vp = shifted.setViewport;
++      vp.left *= 0.5f; vp.top *= 0.5f; vp.width *= 0.5f; vp.height *= 0.5f;
++      payload = &shifted;
++    } else if (type == CommandType::SetScissor) {
++      shifted = *payload;
++      auto& sc = shifted.setScissor;
++      const int32_t x0 = sc.x >> 1, y0 = sc.y >> 1;
++      const int32_t x1 = (sc.x + sc.width + 1) >> 1, y1 = (sc.y + sc.height + 1) >> 1;
++      sc = {x0, y0, std::max(x1 - x0, 0), std::max(y1 - y0, 0)};
++      payload = &shifted;
++    }
++  }
++#else
++  const Command::Data* payload = &data;
++#endif
+   auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
+   AURORA_ASSERT(!renderPass.sealed, "Attempted to append command {} to sealed render pass {}",
+                 magic_enum::enum_name(type), g_recorder.currentRenderPass);
+   if (type == CommandType::Draw || type == CommandType::CustomDraw) {
+     renderPass.hasDraws = true;
++#ifdef MELEE_MIYOO_FLIP
++    // GX draws only: a clear draw's channels come from its pipeline config
++    // (flip_leading_clear), not from the GX state current when it was pushed.
++    clear::DrawData clearDraw;
++    if (type == CommandType::Draw && !decode_flip_clear_draw(data.draw, clearDraw)) {
++      renderPass.flipWriteMask |= flip_current_write_mask();
++    }
++#endif
+   }
+   renderPass.commands.push_back({
+       .type = type,
+ #ifdef AURORA_GFX_DEBUG_GROUPS
+       .debugGroupStack = g_recorder.debugGroupStack,
+ #endif
+-      .data = data,
++      .data = *payload,
+   });
+ }
+ 
+@@ -423,6 +586,7 @@ void suspend_efb() {
+                 "suspend_efb called outside of an active recording frame");
+   AURORA_ASSERT(!g_recorder.inOffscreen, "suspend_efb called while offscreen rendering is active");
+   AURORA_ASSERT(!g_recorder.suspendedEfbPass, "suspend_efb called with an EFB pass already suspended");
++  FLIP_FUSION_SETTLE("break", splitBreak);
+ 
+   auto& currentPass = current_render_passes()[g_recorder.currentRenderPass];
+   if (!currentPass.has_consumer()) {
+@@ -520,8 +684,423 @@ void enqueue_op(FramePacket& frame, uint32_t opIndex) {
+   });
+ }
+ 
++// The EFB pass that follows an EFB copy: same targets, contents loaded unless
++// cleared.
++RenderPass make_efb_continuation(const RenderPass& prevPass, bool clearDepth, float clearDepthValue,
++                                 bool fullColorClear, Vec4<float> clearColorValue) {
++  RenderPass newPass{
++      .label = pass_label(g_recorder.inOffscreen ? "Offscreen" : "EFB"),
++      .colorAttachments = prevPass.colorAttachments,
++      .colorAttachmentCount = prevPass.colorAttachmentCount,
++      .depthStencilView = prevPass.depthStencilView,
++      .depthStencilFormat = prevPass.depthStencilFormat,
++      .copySourceTexture = prevPass.copySourceTexture,
++      .copySourceView = prevPass.copySourceView,
++      .copySourceDepthView = prevPass.copySourceDepthView,
++      .msaaSamples = prevPass.msaaSamples,
++      .clearDepthValue = clearDepthValue,
++      .clearDepth = clearDepth,
++      .hasDepth = prevPass.hasDepth,
++      .hasStencil = prevPass.hasStencil,
++  };
++  for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
++    auto& color = newPass.colorAttachments[i];
++    color.loadOp = wgpu::LoadOp::Undefined;
++    color.clear = false;
++  }
++  if (fullColorClear) {
++    auto& sceneColor = newPass.colorAttachments[SceneColorAttachmentIndex];
++    sceneColor.clear = true;
++    sceneColor.clearValue = clearColorValue;
++  }
++  newPass.commands.reserve(2048);
++  return newPass;
++}
++
++#ifdef MELEE_MIYOO_FLIP
++bool flip_vec4_equal(const Vec4<float>& a, const Vec4<float>& b) {
++  return a.x() == b.x() && a.y() == b.y() && a.z() == b.z() && a.w() == b.w();
++}
++
++// Scans commands [begin, end): 0 if every draw stays within [minLeft, maxRight)
++// horizontally, 1 if a clear or custom draw is present, 2 if a draw can reach
++// outside the region. Passes always start with viewport/scissor commands, so a
++// draw before either is treated as unbounded.
++int flip_segment_check(const RenderPass& pass, size_t begin, size_t end, int32_t minLeft, int32_t maxRight) {
++  const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
++  Viewport vp{0.f, 0.f, static_cast<float>(size.width), static_cast<float>(size.height), 0.f, 1.f};
++  ClipRect sc{0, 0, static_cast<int32_t>(size.width), static_cast<int32_t>(size.height)};
++  for (size_t i = begin; i < end; ++i) {
++    const auto& cmd = pass.commands[i];
++    switch (cmd.type) {
++    case CommandType::SetViewport:
++      vp = cmd.data.setViewport;
++      break;
++    case CommandType::SetScissor:
++      sc = cmd.data.setScissor;
++      break;
++    case CommandType::Draw: {
++      clear::DrawData clearDraw;
++      if (decode_flip_clear_draw(cmd.data.draw, clearDraw)) {
++        return 1;
++      }
++      const auto left = std::max(static_cast<int32_t>(std::floor(vp.left)), sc.x);
++      const auto right = std::min(static_cast<int32_t>(std::ceil(vp.left + vp.width)), sc.x + sc.width);
++      if (left < right && (left < minLeft || right > maxRight)) {
++        return 2;
++      }
++    } break;
++    case CommandType::CustomDraw:
++      return 1;
++    default:
++      break;
++    }
++  }
++  return 0;
++}
++
++std::array<float, 4> flip_uv_transform(const RenderPass& pass, const ClipRect& rect) {
++  const auto srcW = static_cast<float>(pass.colorAttachments[SceneColorAttachmentIndex].size.width);
++  const auto srcH = static_cast<float>(pass.colorAttachments[SceneColorAttachmentIndex].size.height);
++  return {
++      static_cast<float>(rect.x) / srcW,
++      static_cast<float>(rect.y) / srcH,
++      static_cast<float>(rect.width) / srcW,
++      static_cast<float>(rect.height) / srcH,
++  };
++}
++Range flip_resolve_uniform(const RenderPass& pass, const ClipRect& rect) {
++  return push_uniform(flip_uv_transform(pass, rect));
++}
++
++// A pass that follows a color- or alpha-only EFB copy clear opens with a
++// full-EFB clear draw (resolve_pass_into). It clears the whole attachment like
++// a load-op clear would; report which channels it clears and with what color.
++struct FlipLeadingClear {
++  bool present = false;
++  bool color = false, alpha = false, depth = false;
++  Vec4<float> value{};
++};
++FlipLeadingClear flip_leading_clear(const RenderPass& pass) {
++  FlipLeadingClear out;
++  if (pass.commands.empty() || pass.commands[0].type != CommandType::Draw) {
++    return out;
++  }
++  clear::DrawData draw;
++  clear::PipelineConfig config;
++  if (!decode_flip_clear_draw(pass.commands[0].data.draw, draw) || !clear::find_flip_pipeline_config(draw.pipeline, config)) {
++    return out;
++  }
++  out.present = true;
++  out.color = config.clearColor;
++  out.alpha = config.clearAlpha;
++  out.depth = config.clearDepth;
++  out.value = {static_cast<float>(draw.color.r), static_cast<float>(draw.color.g), static_cast<float>(draw.color.b),
++               static_cast<float>(draw.color.a)};
++  return out;
++}
++
++// Called after the first resolve of `pass` has been recorded. Starts recording
++// the following EFB pass into the same RenderPass, shifted right of `rect`.
++bool flip_fusion_begin(RenderPass& pass, const ClipRect& rect, bool clearColor, bool clearAlpha, bool clearDepth,
++                       Vec4<float> clearColorValue, float clearDepthValue) {
++  auto& stats = g_fusion.stats;
++  if (!flip_fuse_enabled() || g_recorder.inOffscreen || g_recorder.suppressRenderWorker) {
++    return false;
++  }
++  const FlipLeadingClear leading = flip_leading_clear(pass);
++  const uint8_t leadingMask = (leading.color ? 1u : 0u) | (leading.alpha ? 2u : 0u) | (leading.depth ? 4u : 0u);
++  const uint8_t firstWrites = pass.flipWriteMask | leadingMask;
++  // The second pass would start from the copy's clear where it clears, and
++  // from the first pass's untouched pixels elsewhere. Region 2 of the fused
++  // pass holds the pass-start state instead, so every channel the copy clears
++  // must have been cleared identically at pass start, and every channel it
++  // does not clear must be unwritten by the first segment. (Melee's shadow
++  // copies clear color only: alpha and Z updates are off in that pass.)
++  const uint8_t clearMask = (clearColor ? 1u : 0u) | (clearAlpha ? 2u : 0u) | (clearDepth ? 4u : 0u);
++  if ((firstWrites & ~clearMask) != 0) {
++    ++stats.refused, ++stats.refuseClear;
++    return false;
++  }
++  const auto& color = pass.colorAttachments[SceneColorAttachmentIndex];
++  if (pass.colorAttachmentCount != 1 || pass.msaaSamples != 1 || !pass.flipExtraResolves.empty()) {
++    ++stats.refused, ++stats.refuseState;
++    return false;
++  }
++  // Each channel the copy clears must already hold the same clear value from
++  // the pass start: a load-op clear, or the leading full-EFB clear draw.
++  const bool loadCleared = color.clear && color.loadOp != wgpu::LoadOp::Load;
++  const auto& lv = leading.value;
++  const auto& cv = color.clearValue;
++  const bool rgbCleared = (loadCleared && cv.x() == clearColorValue.x() && cv.y() == clearColorValue.y() &&
++                           cv.z() == clearColorValue.z()) ||
++                          (leading.color && lv.x() == clearColorValue.x() && lv.y() == clearColorValue.y() &&
++                           lv.z() == clearColorValue.z());
++  const bool alphaCleared = (loadCleared && cv.w() == clearColorValue.w()) || (leading.alpha && lv.w() == clearColorValue.w());
++  if ((clearColor && !rgbCleared) || (clearAlpha && !alphaCleared) ||
++      (clearDepth && !(pass.clearDepth && pass.clearDepthValue == clearDepthValue))) {
++    ++stats.refused, ++stats.refuseState;
++    return false;
++  }
++  const auto efbWidth = static_cast<int32_t>(color.size.width);
++  const auto efbHeight = static_cast<int32_t>(color.size.height);
++  if (rect.x < 0 || rect.y < 0 || rect.width <= 0 || rect.height <= 0 || rect.x + rect.width > efbWidth ||
++      rect.y + rect.height > efbHeight) {
++    ++stats.refused, ++stats.refuseRegion;
++    return false;
++  }
++  const int32_t offsetX = rect.x + rect.width;
++  if (offsetX + rect.width > efbWidth) {
++    ++stats.refused, ++stats.refuseRoom;
++    return false;
++  }
++  // Only a first segment that wrote nothing but color can complete a fusion:
++  // the second copy has to clear every channel either segment wrote, and
++  // shadow copies clear color only. Fountain's reflection pass writes depth;
++  // attempting it would defer that large pass and split every frame.
++  if ((firstWrites & ~1u) != 0) {
++    ++stats.refused, ++stats.refuseClear;
++    return false;
++  }
++  if (const int check = flip_segment_check(pass, leading.present ? 1 : 0, pass.commands.size(), 0, offsetX); check != 0) {
++    ++stats.refused;
++    if (check == 1) ++stats.refuseDraws; else ++stats.refuseRegion;
++    return false;
++  }
++  g_fusion.active = true;
++  g_fusion.pass = g_recorder.currentRenderPass;
++  g_fusion.segmentStart = pass.commands.size();
++  g_fusion.offsetX = offsetX;
++  g_fusion.firstTarget = pass.resolveTarget;
++  g_fusion.clearColorValue = clearColorValue;
++  g_fusion.clearDepthValue = clearDepthValue;
++  g_fusion.clearColor1 = clearColor;
++  g_fusion.clearAlpha1 = clearAlpha;
++  g_fusion.clearDepth1 = clearDepth;
++  g_fusion.firstWrites = firstWrites;
++  g_fusion.segmentWrites = 0;
++  // push_command shifts these while the fusion is active.
++  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
++  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++  return true;
++}
++
++// Second EFB copy while a fusion is active: attach it to the fused pass.
++bool flip_fusion_complete(const TextureHandle& texture, const ClipRect& rect, bool clearColor, bool clearAlpha,
++                          bool clearDepth, GXTexFmt format) {
++  auto& pass = current_render_passes()[g_fusion.pass];
++  // After the second copy the fused pass leaves the second shadow in a
++  // different place than the original would. Aurora clears the whole EFB for
++  // the channels a copy clears, so those match; anything either segment wrote
++  // to an uncleared channel would remain visible in the wrong place.
++  const uint8_t clearMask = (clearColor ? 1u : 0u) | (clearAlpha ? 2u : 0u) | (clearDepth ? 4u : 0u);
++  const bool fullClear = ((g_fusion.firstWrites | g_fusion.segmentWrites) & ~clearMask) == 0;
++  const auto& color = pass.colorAttachments[SceneColorAttachmentIndex];
++  const auto efbWidth = static_cast<int32_t>(color.size.width);
++  const auto efbHeight = static_cast<int32_t>(color.size.height);
++  ClipRect shifted = rect;
++  shifted.x += g_fusion.offsetX;
++  if (!fullClear || rect.x < 0 || rect.y < 0 || rect.width <= 0 || rect.height <= 0 || shifted.x + shifted.width > efbWidth ||
++      rect.y + rect.height > efbHeight) {
++    return false;
++  }
++  if (flip_segment_check(pass, g_fusion.segmentStart, pass.commands.size(), g_fusion.offsetX, efbWidth) != 0) {
++    return false;
++  }
++  pass.flipExtraResolves.push_back({
++      .target = texture,
++      .format = format,
++      .rect = shifted,
++      .uniformRange = flip_resolve_uniform(pass, shifted),
++  });
++  pass.flipSegmentStart = static_cast<uint32_t>(g_fusion.segmentStart);
++  // Both transforms together for the two-target conversion pass.
++  const auto uv1 = flip_uv_transform(pass, pass.resolveRect);
++  const auto uv2 = flip_uv_transform(pass, shifted);
++  const std::array<float, 8> both{uv1[0], uv1[1], uv1[2], uv1[3], uv2[0], uv2[1], uv2[2], uv2[3]};
++  pass.flipDualResolveUniform = push_uniform(both);
++  g_fusion.active = false;
++  g_fusion.firstTarget = {};
++  ++g_fusion.stats.fused;
++  return true;
++}
++
++// Gives up an active fusion: the shifted segment becomes its own pass again.
++void flip_fusion_split(const char* reason, unsigned& counter) {
++  if (!g_fusion.active) {
++    return;
++  }
++  g_fusion.active = false;
++  g_fusion.firstTarget = {};
++  ++counter;
++  ++g_fusion.stats.split;
++  auto& passes = current_render_passes();
++  auto& fused = passes[g_fusion.pass];
++  const bool fullColorClear = g_fusion.clearColor1 && g_fusion.clearAlpha1;
++  RenderPass newPass =
++      make_efb_continuation(fused, g_fusion.clearDepth1, g_fusion.clearDepthValue, fullColorClear, g_fusion.clearColorValue);
++  newPass.flipWriteMask = g_fusion.segmentWrites;
++  if (!fullColorClear && (g_fusion.clearColor1 || g_fusion.clearAlpha1)) {
++    // The copy would have opened the pass with a color- or alpha-only clear draw.
++    const auto& value = g_fusion.clearColorValue;
++    newPass.commands.push_back(Command{
++        .type = CommandType::Draw,
++        .data = {.draw = make_draw_command<clear::render>(clear::DrawData{
++                     .pipeline = pipeline_ref(clear::make_pipeline_config(newPass.target_layout(), g_fusion.clearColor1,
++                                                                          g_fusion.clearAlpha1, false)),
++                     .color = wgpu::Color{.r = value.x(), .g = value.y(), .b = value.z(), .a = value.w()},
++                 })},
++    });
++    newPass.hasDraws = true;
++  }
++  const auto segment = fused.commands.begin() + static_cast<std::ptrdiff_t>(g_fusion.segmentStart);
++  newPass.commands.insert(newPass.commands.end(), std::make_move_iterator(segment),
++                          std::make_move_iterator(fused.commands.end()));
++  fused.commands.erase(segment, fused.commands.end());
++  fused.hasDraws = false;
++  for (const auto& cmd : fused.commands) {
++    if (cmd.type == CommandType::Draw || cmd.type == CommandType::CustomDraw) {
++      fused.hasDraws = true;
++      break;
++    }
++  }
++  for (auto& cmd : newPass.commands) {
++    if (cmd.type == CommandType::SetViewport) {
++      cmd.data.setViewport.left -= static_cast<float>(g_fusion.offsetX);
++    } else if (cmd.type == CommandType::SetScissor) {
++      cmd.data.setScissor.x -= g_fusion.offsetX;
++    } else if (cmd.type == CommandType::Draw || cmd.type == CommandType::CustomDraw) {
++      newPass.hasDraws = true;
++    }
++  }
++  if (flip_fuse_trace()) {
++    std::fprintf(stderr, "[flip-pass-fuse] split reason=%s pass=%u moved=%zu\n", reason, g_fusion.pass,
++                 newPass.commands.size());
++  }
++  enqueue_pass(current_frame_packet(), g_fusion.pass);
++  passes.emplace_back(std::move(newPass));
++  g_recorder.currentRenderPass = static_cast<uint32_t>(passes.size() - 1);
++}
++
++void flip_fusion_settle(const char* reason, unsigned& counter) { flip_fusion_split(reason, counter); }
++
++// ---- Half-res sprite segments -------------------------------------------
++void flip_append_encoder_task(FramePacket& frame, EncoderTaskId type) {
++  const auto taskIndex = static_cast<uint32_t>(frame.encoderTasks.size());
++  auto& task = frame.encoderTasks.emplace_back(EncoderTask{.type = type});
++  task.payloadSize = 0;
++  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
++  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::EncoderTask, taskIndex));
++  enqueue_op(frame, opIndex);
++}
++
++unsigned g_spriteRefuse[6]{}; // lineMode, blendMode, factors, depthWrite, dstAlpha, colorUpdate
++bool flip_sprite_eligible(const gx::PipelineConfig& c) {
++  bool ok = true;
++  if (c.shaderConfig.lineMode != 3) { ++g_spriteRefuse[0]; ok = false; }
++  // Opaque (alpha-tested) sprites or SRCALPHA blends onto INVSRCALPHA/ONE.
++  if (c.blendMode != GX_BM_BLEND && c.blendMode != GX_BM_NONE) { ++g_spriteRefuse[1]; ok = false; }
++  if (c.blendMode == GX_BM_BLEND &&
++      !(c.blendFacSrc == GX_BL_SRCALPHA && (c.blendFacDst == GX_BL_INVSRCALPHA || c.blendFacDst == GX_BL_ONE))) { ++g_spriteRefuse[2]; ok = false; }
++  // Depth-writing sprites only update the half-res depth; geometry drawn after
++  // them in the frame is not occluded by them (an approximation of the pass).
++  if (c.depthCompare && c.depthUpdate) { ++g_spriteRefuse[3]; }
++  if (c.dstAlpha != UINT32_MAX) { ++g_spriteRefuse[4]; ok = false; }
++  if (!c.colorUpdate) { ++g_spriteRefuse[5]; ok = false; }
++  return ok;
++}
++
++void flip_sprite_begin_segment() {
++  auto& frame = current_frame_packet();
++  flip_fusion_settle("sprites", g_fusion.stats.splitBreak);
++  g_sprites.savedViewport = g_recorder.cachedViewport;
++  g_sprites.savedScissor = g_recorder.cachedScissor;
++  // Seal the EFB pass so far, prepare the half-res targets (clear + depth
++  // downsample), then record the sprites into the half-res pass.
++  enqueue_pass(frame, g_recorder.currentRenderPass);
++  g_recorder.currentRenderPass = UINT32_MAX;
++  flip_append_encoder_task(frame, flip_sprites::prep_task());
++  const auto& color = flip_sprites::color_target();
++  const auto& depth = flip_sprites::depth_target();
++  begin_color_pass(ColorPassDescriptor{
++      .label = "Sprites",
++      .colorView = color.view,
++      .colorFormat = color.format,
++      .depthStencilView = depth.view,
++      .depthStencilFormat = depth.format,
++      .targetSize = color.size,
++      .colorLoadOp = wgpu::LoadOp::Load,
++      .colorStoreOp = wgpu::StoreOp::Store,
++      .hasDepth = true,
++      .depthLoadOp = wgpu::LoadOp::Load,
++      .depthStoreOp = wgpu::StoreOp::Store,
++  });
++  g_recorder.cachedViewport = g_sprites.savedViewport;
++  g_recorder.cachedScissor = g_sprites.savedScissor;
++  g_sprites.active = true;
++  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
++  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++  ++g_sprites.stats.segments;
++}
++
++void flip_sprite_end_segment() {
++  g_sprites.active = false;
++  auto& frame = current_frame_packet();
++  end_color_pass();
++  flip_append_encoder_task(frame, flip_sprites::composite_task());
++  // Resume the EFB pass, loading its contents.
++  auto& pass = current_render_passes().emplace_back();
++  pass.label = pass_label("EFB");
++  set_efb_targets(pass);
++  for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
++    pass.colorAttachments[i].clear = false;
++    pass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
++  }
++  pass.clearDepth = false;
++  pass.commands.reserve(2048);
++  g_recorder.currentRenderPass = static_cast<uint32_t>(current_render_passes().size() - 1);
++  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
++  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++}
++
++void flip_sprite_frame_end() {
++  auto& s = g_sprites;
++  s.prevFramePoints = s.framePoints;
++  s.framePoints = 0;
++  if (++s.stats.frames % 600 == 0) {
++    std::fprintf(stderr,
++                 "[flip-sprites] frames=%u segments=%u points=%u refused=%u (line=%u blend=%u factors=%u zwrite=%u dstalpha=%u "
++                 "color=%u) last_frame_points=%u\n",
++                 s.stats.frames, s.stats.segments, s.stats.points, s.stats.refused, g_spriteRefuse[0], g_spriteRefuse[1],
++                 g_spriteRefuse[2], g_spriteRefuse[3], g_spriteRefuse[4], g_spriteRefuse[5], s.prevFramePoints);
++    s.stats = {};
++    for (auto& n : g_spriteRefuse) n = 0;
++  }
++}
++
++void flip_fusion_frame_end() {
++  auto& s = g_fusion.stats;
++  if (++s.frames % 600 != 0) {
++    return;
++  }
++  std::fprintf(stderr,
++               "[flip-pass-fuse] frames=%u fused=%u refused=%u (clear=%u state=%u region=%u room=%u draws=%u) "
++               "split=%u (viewport=%u scissor=%u clear=%u custom=%u texture=%u break=%u second=%u palette=%u)\n",
++               s.frames, s.fused, s.refused, s.refuseClear, s.refuseState, s.refuseRegion, s.refuseRoom, s.refuseDraws,
++               s.split, s.splitViewport, s.splitScissor, s.splitClear, s.splitCustom, s.splitTexture, s.splitBreak,
++               s.splitSecond, s.splitPalette);
++  s = {};
++}
++#endif
++
  void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
    seal_pass(frame, passIndex);
 +#ifdef MELEE_MIYOO_FLIP
@@ -2874,7 +4095,7 @@ index d04db0f..1f6494a 100644
    const auto opIndex = static_cast<uint32_t>(frame.ops.size());
    frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderPass, passIndex));
    enqueue_op(frame, opIndex);
-@@ -531,6 +542,9 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
+@@ -531,6 +1110,9 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
  namespace detail {
  
  void begin_recording(FramePacket& packet, size_t frameSlot) {
@@ -2884,7 +4105,7 @@ index d04db0f..1f6494a 100644
    CHECK(!g_recorder.active(), "A recording session is already active");
    g_recorder.packet = &packet;
    g_recorder.frameSlot = frameSlot;
-@@ -552,6 +566,9 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
+@@ -552,6 +1134,9 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
    push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
  }
  
@@ -2894,7 +4115,178 @@ index d04db0f..1f6494a 100644
  RecordedFrame end_recording() {
    CHECK(g_recorder.active(), "No active recording session");
    AURORA_ASSERT(!g_recorder.inOffscreen, "end_frame called while offscreen rendering is active");
-@@ -1063,6 +1080,23 @@ void push_draw_command(gx::DrawData data) {
+@@ -673,6 +1258,7 @@ void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureIn
+   ZoneScoped;
+   auto& frame = current_frame_packet();
+   if (g_recorder.currentRenderPass != UINT32_MAX) {
++    FLIP_FUSION_SETTLE("break", splitBreak);
+     enqueue_pass(frame, g_recorder.currentRenderPass);
+     g_recorder.currentRenderPass = UINT32_MAX;
+   }
+@@ -692,6 +1278,7 @@ void begin_color_pass(const ColorPassDescriptor& desc) {
+   ZoneScoped;
+   auto& frame = current_frame_packet();
+   if (g_recorder.currentRenderPass != UINT32_MAX) {
++    FLIP_FUSION_SETTLE("break", splitBreak);
+     enqueue_pass(frame, g_recorder.currentRenderPass);
+   }
+ 
+@@ -780,6 +1367,7 @@ void set_scissor(const ClipRect& cmd) noexcept {
+ 
+ template <>
+ void push_draw_command(clear::DrawData data) {
++  FLIP_FUSION_SETTLE("clear", splitClear);
+   push_draw_command(make_draw_command<clear::render>(data));
+ }
+ 
+@@ -790,53 +1378,81 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
+ 
+ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
+                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {
++  bool fusedSecond = false;
++#ifdef MELEE_MIYOO_FLIP
++  if (g_fusion.active) {
++    fusedSecond = flip_fusion_complete(texture, rect, clearColor, clearAlpha, clearDepth, resolveFormat);
++    if (!fusedSecond) {
++      flip_fusion_split("second", g_fusion.stats.splitSecond);
++    }
++  }
++#endif
+   // Resolve current render pass
+   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+-  prevPass.resolveTarget = std::move(texture);
+-  prevPass.resolveRect = rect;
+-  prevPass.resolveFormat = resolveFormat;
+-  // Push UV transform uniform for tex_copy_conv (crop region in UV space)
+-  const auto srcW = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.width);
+-  const auto srcH = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.height);
+-  const std::array uvTransform{
+-      static_cast<float>(rect.x) / srcW,
+-      static_cast<float>(rect.y) / srcH,
+-      static_cast<float>(rect.width) / srcW,
+-      static_cast<float>(rect.height) / srcH,
+-  };
+-  prevPass.resolveUniformRange = push_uniform(uvTransform);
++#ifdef MELEE_MIYOO_FLIP
++  // Scaled copy (reflection): render it only every Nth frame; in between the
++  // pass is discarded and the texture keeps its last image. Only when the copy
++  // clears color (the pass's EFB content is not used afterwards) and only for
++  // targets that already hold an image.
++  // Reflection-style copies: small (<= 128x128) color-format targets rendered
++  // by a dedicated camera pass (Fountain: 80x60 RGB565, ~150 draws). Shadow
++  // maps are intensity formats and stay every-frame.
++  const bool colorFormat = resolveFormat != GX_CTF_R4 && resolveFormat != GX_TF_I4 && resolveFormat != GX_TF_I8 &&
++                           resolveFormat != GX_TF_IA4 && resolveFormat != GX_TF_IA8 && resolveFormat != GX_CTF_R8 &&
++                           resolveFormat != GX_CTF_A8 && !gx::is_depth_format(resolveFormat);
++  if (!fusedSecond && texture && flip_scaled_copy_interval() > 1 && !g_recorder.inOffscreen && colorFormat &&
++      rect.width <= 128 && rect.height <= 128 && clearColor) {
++    const TextureRef* key = texture.get();
++    const bool due = g_scaledCopies.frame % flip_scaled_copy_interval() == 0;
++    if (!due && g_scaledCopies.rendered.count(key)) {
++      ++g_scaledCopies.skipped;
++      prevPass.discardable = true;
++      enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
++      const bool fullColorClear = clearColor && clearAlpha;
++      current_render_passes().emplace_back(
++          make_efb_continuation(prevPass, clearDepth, clearDepthValue, fullColorClear, clearColorValue));
++      ++g_recorder.currentRenderPass;
++      if (!fullColorClear && (clearColor || clearAlpha)) {
++        const auto targetLayout = current_render_passes()[g_recorder.currentRenderPass].target_layout();
++        push_draw_command(clear::DrawData{
++            .pipeline = pipeline_ref(clear::make_pipeline_config(targetLayout, clearColor, clearAlpha, false)),
++            .color = wgpu::Color{.r = clearColorValue.x(), .g = clearColorValue.y(), .b = clearColorValue.z(), .a = clearColorValue.w()},
++        });
++      }
++      push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
++      push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
++      return;
++    }
++    g_scaledCopies.rendered.insert(key);
++    ++g_scaledCopies.rendered_count;
++  }
++#endif
++  if (!fusedSecond) {
++    prevPass.resolveTarget = std::move(texture);
++    prevPass.resolveRect = rect;
++    prevPass.resolveFormat = resolveFormat;
++    // Push UV transform uniform for tex_copy_conv (crop region in UV space)
++    const auto srcW = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.width);
++    const auto srcH = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.height);
++    const std::array uvTransform{
++        static_cast<float>(rect.x) / srcW,
++        static_cast<float>(rect.y) / srcH,
++        static_cast<float>(rect.width) / srcW,
++        static_cast<float>(rect.height) / srcH,
++    };
++    prevPass.resolveUniformRange = push_uniform(uvTransform);
++#ifdef MELEE_MIYOO_FLIP
++    if (flip_fusion_begin(prevPass, rect, clearColor, clearAlpha, clearDepth, clearColorValue, clearDepthValue)) {
++      return;
++    }
++#endif
++  }
+   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+ 
+   // Populate new render pass from previous
+-  const auto msaaSamples = prevPass.msaaSamples;
+-  RenderPass newPass{
+-      .label = pass_label(g_recorder.inOffscreen ? "Offscreen" : "EFB"),
+-      .colorAttachments = prevPass.colorAttachments,
+-      .colorAttachmentCount = prevPass.colorAttachmentCount,
+-      .depthStencilView = prevPass.depthStencilView,
+-      .depthStencilFormat = prevPass.depthStencilFormat,
+-      .copySourceTexture = prevPass.copySourceTexture,
+-      .copySourceView = prevPass.copySourceView,
+-      .copySourceDepthView = prevPass.copySourceDepthView,
+-      .msaaSamples = msaaSamples,
+-      .clearDepthValue = clearDepthValue,
+-      .clearDepth = clearDepth,
+-      .hasDepth = prevPass.hasDepth,
+-      .hasStencil = prevPass.hasStencil,
+-  };
+   const bool fullColorClear = clearColor && clearAlpha;
+-  for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
+-    auto& color = newPass.colorAttachments[i];
+-    color.loadOp = wgpu::LoadOp::Undefined;
+-    color.clear = false;
+-  }
+-  if (fullColorClear) {
+-    auto& sceneColor = newPass.colorAttachments[SceneColorAttachmentIndex];
+-    sceneColor.clear = true;
+-    sceneColor.clearValue = clearColorValue;
+-  }
+-  newPass.commands.reserve(2048);
+-  current_render_passes().emplace_back(std::move(newPass));
++  current_render_passes().emplace_back(
++      make_efb_continuation(prevPass, clearDepth, clearDepthValue, fullColorClear, clearColorValue));
+   ++g_recorder.currentRenderPass;
+ 
+   if (!fullColorClear && (clearColor || clearAlpha)) {
+@@ -858,6 +1474,7 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
+ }
+ 
+ void queue_palette_conv(tex_palette_conv::ConvRequest req) {
++  FLIP_FUSION_SETTLE("palette", splitPalette);
+   auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
+   AURORA_ASSERT(!renderPass.sealed, "Attempted to append palette conversion to sealed render pass {}",
+                 g_recorder.currentRenderPass);
+@@ -973,6 +1590,7 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
+     wantDepth = false;
+   }
+ 
++  FLIP_FUSION_SETTLE("break", splitBreak);
+   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+   const uint32_t width = prevPass.colorAttachments[SceneColorAttachmentIndex].size.width;
+   const uint32_t height = prevPass.colorAttachments[SceneColorAttachmentIndex].size.height;
+@@ -1040,6 +1658,7 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
+   // pass that loads the existing contents. EFB writes persist into the continuation, so
+   // content keeps the sealed pass alive even without a consumer.
+   auto& frame = current_frame_packet();
++  FLIP_FUSION_SETTLE("break", splitBreak);
+   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+   prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
+   enqueue_pass(frame, g_recorder.currentRenderPass);
+@@ -1063,6 +1682,23 @@ void push_draw_command(gx::DrawData data) {
    push_draw_command(make_draw_command<gx::render>(data));
  }
  
@@ -2918,7 +4310,7 @@ index d04db0f..1f6494a 100644
  #ifdef AURORA_ENABLE_RMLUI
  template <>
  void push_draw_command(rmlui::DrawData data) {
-@@ -1070,8 +1104,34 @@ void push_draw_command(rmlui::DrawData data) {
+@@ -1070,8 +1706,61 @@ void push_draw_command(rmlui::DrawData data) {
  }
  #endif
  
@@ -2937,6 +4329,33 @@ index d04db0f..1f6494a 100644
 +  }
 +  return canonical;
 +}
++bool flip_sprite_point_draw(const gx::PipelineConfig& config, uint32_t points) {
++  auto& s = g_sprites;
++  s.framePoints += points;
++  if (!flip_sprites::enabled() || g_recorder.inOffscreen || g_recorder.currentRenderPass == UINT32_MAX) {
++    if (s.active) flip_sprite_end_segment();
++    return false;
++  }
++  if (!flip_sprite_eligible(config)) {
++    ++s.stats.refused;
++    if (s.active) flip_sprite_end_segment();
++    return false;
++  }
++  if (!s.active) {
++    if (s.prevFramePoints < flip_sprites::threshold()) return false;
++    flip_sprite_begin_segment();
++  }
++  s.stats.points += points;
++  return s.active;
++}
++void flip_sprite_settle() {
++  if (g_sprites.active) flip_sprite_end_segment();
++}
++void flip_fusion_texture_bound(const TextureHandle& handle) noexcept {
++  if (g_fusion.active && handle && handle.get() == g_fusion.firstTarget.get()) {
++    flip_fusion_split("texture", g_fusion.stats.splitTexture);
++  }
++}
 +PipelineRef pipeline_ref_async(const gx::PipelineConfig& config) {
 +  const auto canonical = (config.shaderConfig.flipFlags & gx::FlipVertexInput) ? flip_canonical_config(config) : config;
 +  return find_pipeline_async(ShaderType::GX, canonical, [=] { return create_pipeline(canonical); });
@@ -2953,7 +4372,24 @@ index d04db0f..1f6494a 100644
    return find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
  }
  
-@@ -1114,12 +1174,41 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+@@ -1089,6 +1778,16 @@ void finish() {
+   }
+   AURORA_ASSERT(!g_recorder.inOffscreen, "finish called while offscreen rendering is active");
+   if (g_recorder.currentRenderPass != UINT32_MAX) {
++    FLIP_FUSION_SETTLE("break", splitBreak);
++#ifdef MELEE_MIYOO_FLIP
++    flip_fusion_frame_end();
++    flip_sprite_frame_end();
++    if (++g_scaledCopies.frame % 600 == 0 && (g_scaledCopies.skipped || g_scaledCopies.rendered_count)) {
++      std::fprintf(stderr, "[flip-scaled-copy] frames=600 rendered=%u skipped=%u targets=%zu\n", g_scaledCopies.rendered_count,
++                   g_scaledCopies.skipped, g_scaledCopies.rendered.size());
++      g_scaledCopies.skipped = g_scaledCopies.rendered_count = 0;
++    }
++#endif
+     auto& frame = current_frame_packet();
+     frame.uniforms.append_zeroes(gx::MaxUniformSize);
+     auto& pass = frame.renderPasses[g_recorder.currentRenderPass];
+@@ -1114,12 +1813,41 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
    return push(current_frame_packet().indices, data, length, alignment);
  }
  
@@ -2997,7 +4433,7 @@ index d04db0f..1f6494a 100644
  
  Range push_storage(const uint8_t* data, size_t length) {
 diff --git a/lib/gfx/recording.hpp b/lib/gfx/recording.hpp
-index cd2b794..f931895 100644
+index cd2b794..2fb92f1 100644
 --- a/lib/gfx/recording.hpp
 +++ b/lib/gfx/recording.hpp
 @@ -16,6 +16,8 @@ struct RecordedFrame {
@@ -3029,12 +4465,20 @@ index cd2b794..f931895 100644
  template <typename T>
  Range push_uniform(const T& data) {
    return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
-@@ -97,6 +105,9 @@ template <typename DrawData>
+@@ -97,6 +105,17 @@ template <typename DrawData>
  DrawData* get_last_draw_command();
  template <typename PipelineConfig>
  PipelineRef pipeline_ref(const PipelineConfig& config);
 +#ifdef MELEE_MIYOO_FLIP
 +PipelineRef pipeline_ref_async(const gx::PipelineConfig& config);
++// Shadow-pass fusion: a draw that samples the first copy of a fused pass must
++// split the pass so the copy is resolved before the draw.
++void flip_fusion_texture_bound(const TextureHandle& handle) noexcept;
++// Half-res sprite pass: called for every GX point draw; true when the draw must
++// use its sprite-accumulation pipeline variant (it is being recorded into the
++// half-res sprite pass). Non-point draws call flip_sprite_settle().
++bool flip_sprite_point_draw(const gx::PipelineConfig& config, uint32_t points);
++void flip_sprite_settle();
 +#endif
  
  void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
@@ -3305,11 +4749,840 @@ index 3fdc0ee..ae33eff 100644
    wgpu::Buffer vertexBuffer;
    wgpu::Buffer uniformBuffer;
    wgpu::Buffer indexBuffer;
+diff --git a/lib/gfx/tex_copy_conv.cpp b/lib/gfx/tex_copy_conv.cpp
+index 83c3786..387920c 100644
+--- a/lib/gfx/tex_copy_conv.cpp
++++ b/lib/gfx/tex_copy_conv.cpp
+@@ -327,7 +327,87 @@ static wgpu::BindGroupLayout g_depthBindGroupLayout;
+ static wgpu::Sampler g_nearestSampler;
+ static wgpu::Sampler g_linearSampler;
+ static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
++static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_dualPipelines;
+ static wgpu::RenderPipeline g_blitPipeline;
++
++// Dual-target variant: the same conversion applied to two source rectangles,
++// written to two attachments (fused shadow passes resolve both shadow maps in
++// one pass; each pass costs ~0.5 ms of driver time on the Flip).
++static constexpr std::string_view DualShaderPreamble = R"(
++@group(0) @binding(0) var src_samp: sampler;
++@group(0) @binding(1) var src: texture_2d<f32>;
++
++struct UVTransform {
++    offset: vec2f,
++    scale: vec2f,
++    offset2: vec2f,
++    scale2: vec2f,
++};
++@group(0) @binding(2) var<uniform> uv_xf: UVTransform;
++
++struct VertexOutput {
++    @builtin(position) pos: vec4f,
++    @location(0) uv: vec2f,
++    @location(1) uv2: vec2f,
++};
++
++var<private> positions: array<vec2f, 3> = array(
++    vec2f(-1.0, 1.0),
++    vec2f(-1.0, -3.0),
++    vec2f(3.0, 1.0),
++);
++var<private> uvs: array<vec2f, 3> = array(
++    vec2f(0.0, 0.0),
++    vec2f(0.0, 2.0),
++    vec2f(2.0, 0.0),
++);
++
++@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
++    var out: VertexOutput;
++    out.pos = vec4f(positions[vi], 0.0, 1.0);
++    out.uv = uvs[vi] * uv_xf.scale + uv_xf.offset;
++    out.uv2 = uvs[vi] * uv_xf.scale2 + uv_xf.offset2;
++    return out;
++}
++
++fn intensity(rgb: vec3f) -> f32 {
++    // ITU-R BT.601 luma coefficients
++    return dot(rgb, vec3f(0.257, 0.504, 0.098)) + 16.0 / 255.0;
++}
++
++fn quantize4(v: f32) -> f32 {
++    return floor(v * 16.0) / 15.0;
++}
++)"sv;
++
++static constexpr std::string_view DualFragmentEpilogue = R"(
++struct DualOutput {
++    @location(0) a: vec4f,
++    @location(1) b: vec4f,
++};
++@fragment fn fs_main(in: VertexOutput) -> DualOutput {
++    var out: DualOutput;
++    out.a = conv(in.uv);
++    out.b = conv(in.uv2);
++    return out;
++}
++)"sv;
++
++// Rewrites a single-target fragment shader into `fn conv(uv: vec2f) -> vec4f`.
++static std::string dual_fragment_source(std::string_view fragShader) {
++  static constexpr std::string_view signature = "@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {";
++  std::string source{fragShader};
++  const auto pos = source.find(signature);
++  if (pos == std::string::npos) {
++    return {};
++  }
++  source.replace(pos, signature.size(), "fn conv(uv: vec2f) -> vec4f {");
++  for (size_t at = source.find("in.uv"); at != std::string::npos; at = source.find("in.uv", at + 2)) {
++    source.replace(at, 5, "uv");
++  }
++  source += DualFragmentEpilogue;
++  return source;
++}
+ static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
+ static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
+ static wgpu::RenderPipeline g_depthSnapshotPipeline;
+@@ -447,7 +527,57 @@ static wgpu::RenderPipeline create_pipeline(const ConvPipeline& conv, const std:
+   return g_device.CreateRenderPipeline(&pipelineDescriptor);
+ }
+ 
++static wgpu::RenderPipeline create_dual_pipeline(const ConvPipeline& conv, const wgpu::BindGroupLayout& bindGroupLayout) {
++  const std::string frag = dual_fragment_source(conv.fragShader);
++  if (frag.empty()) {
++    return {};
++  }
++  std::string shaderSource;
++  shaderSource += DualShaderPreamble;
++  shaderSource += frag;
++  const std::string label = std::string{conv.label} + " Dual";
++  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
++      .code = shaderSource.c_str(),
++  }};
++  const wgpu::ShaderModuleDescriptor moduleDescriptor{
++      .nextInChain = &wgslSource,
++      .label = label.c_str(),
++  };
++  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
++  const std::array colorTargets{
++      wgpu::ColorTargetState{.format = conv.outputFormat},
++      wgpu::ColorTargetState{.format = conv.outputFormat},
++  };
++  const wgpu::FragmentState fragmentState{
++      .module = module,
++      .entryPoint = "fs_main",
++      .targetCount = colorTargets.size(),
++      .targets = colorTargets.data(),
++  };
++  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
++      .bindGroupLayoutCount = 1,
++      .bindGroupLayouts = &bindGroupLayout,
++  };
++  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
++  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
++      .label = label.c_str(),
++      .layout = pipelineLayout,
++      .vertex =
++          wgpu::VertexState{
++              .module = module,
++              .entryPoint = "vs_main",
++          },
++      .primitive =
++          wgpu::PrimitiveState{
++              .topology = wgpu::PrimitiveTopology::TriangleList,
++          },
++      .fragment = &fragmentState,
++  };
++  return g_device.CreateRenderPipeline(&pipelineDescriptor);
++}
++
+ bool needs_conversion(const GXTexFmt fmt) { return g_pipelines.contains(fmt); }
++bool dual_supported(const GXTexFmt fmt) { return g_dualPipelines.contains(fmt); }
+ 
+ void initialize() {
+   static constexpr std::array bindGroupLayoutEntries{
+@@ -518,6 +648,11 @@ void initialize() {
+     if (conv.outputFormat != to_wgpu(conv.fmt)) {
+       Log.fatal("Output format mismatch for {}", conv.fmt);
+     }
++#ifdef MELEE_MIYOO_FLIP
++    if (auto dual = create_dual_pipeline(conv, g_bindGroupLayout)) {
++      g_dualPipelines[conv.fmt] = std::move(dual);
++    }
++#endif
+   }
+   // Skip depth copies in compatibility mode
+   if (webgpu::g_hasCoreFeatures) {
+@@ -552,6 +687,7 @@ void initialize() {
+ 
+ void shutdown() {
+   g_pipelines.clear();
++  g_dualPipelines.clear();
+   g_blitPipeline = {};
+   g_bindGroupLayout = {};
+   g_depthBindGroupLayout = {};
+@@ -638,6 +774,62 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+   pass.End();
+ }
+ 
++void run_dual(const wgpu::CommandEncoder& cmd, const ConvRequest& req, const TextureHandle& dst2,
++              const Range dualUniformRange) {
++  const auto it = g_dualPipelines.find(req.fmt);
++  if (it == g_dualPipelines.end()) {
++    Log.fatal("No dual copy conversion pipeline for format {}", static_cast<int>(req.fmt));
++  }
++  const auto& sampler = req.sampleFilter == SampleFilter::Linear ? g_linearSampler : g_nearestSampler;
++  const std::array bindGroupEntries{
++      wgpu::BindGroupEntry{
++          .binding = 0,
++          .sampler = sampler,
++      },
++      wgpu::BindGroupEntry{
++          .binding = 1,
++          .textureView = req.srcView,
++      },
++      wgpu::BindGroupEntry{
++          .binding = 2,
++          .buffer = detail::resources().uniformBuffer,
++          .offset = dualUniformRange.offset,
++          .size = dualUniformRange.size,
++      },
++  };
++  const wgpu::BindGroupDescriptor bindGroupDescriptor{
++      .layout = g_bindGroupLayout,
++      .entryCount = bindGroupEntries.size(),
++      .entries = bindGroupEntries.data(),
++  };
++  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++  const std::array colorAttachments{
++      wgpu::RenderPassColorAttachment{
++          .view = req.dst->attachmentTextureView,
++          .loadOp = wgpu::LoadOp::Clear,
++          .storeOp = wgpu::StoreOp::Store,
++          .clearValue = {0.0, 0.0, 0.0, 0.0},
++      },
++      wgpu::RenderPassColorAttachment{
++          .view = dst2->attachmentTextureView,
++          .loadOp = wgpu::LoadOp::Clear,
++          .storeOp = wgpu::StoreOp::Store,
++          .clearValue = {0.0, 0.0, 0.0, 0.0},
++      },
++  };
++  const wgpu::RenderPassDescriptor renderPassDescriptor{
++      .label = "TexCopyConv Dual Pass",
++      .colorAttachmentCount = colorAttachments.size(),
++      .colorAttachments = colorAttachments.data(),
++      .timestampWrites = webgpu::gpu_prof::pass_writes("EFB copy convert"),
++  };
++  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
++  pass.SetPipeline(it->second);
++  pass.SetBindGroup(0, bindGroup);
++  pass.Draw(3);
++  pass.End();
++}
++
+ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
+   const auto it = g_pipelines.find(req.fmt);
+   if (it == g_pipelines.end()) {
+diff --git a/lib/gfx/tex_copy_conv.hpp b/lib/gfx/tex_copy_conv.hpp
+index 34fc5f4..2d67e61 100644
+--- a/lib/gfx/tex_copy_conv.hpp
++++ b/lib/gfx/tex_copy_conv.hpp
+@@ -25,6 +25,10 @@ void initialize();
+ void shutdown();
+ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
+ void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
++// Two same-format, unscaled conversions from one source in a single pass with
++// two color targets. `dualUniformRange` holds both UV transforms (32 bytes).
++bool dual_supported(GXTexFmt fmt);
++void run_dual(const wgpu::CommandEncoder& cmd, const ConvRequest& req, const TextureHandle& dst2, Range dualUniformRange);
+ 
+ bool snapshot_depth_supported() noexcept;
+ void snapshot_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& srcDepth, uint32_t msaaSamples,
+diff --git a/lib/gfx/tex_palette_conv.cpp b/lib/gfx/tex_palette_conv.cpp
+index 392dcc8..a0914c7 100644
+--- a/lib/gfx/tex_palette_conv.cpp
++++ b/lib/gfx/tex_palette_conv.cpp
+@@ -100,6 +100,17 @@ static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, wgpu
+   shaderSource.reserve(ShaderPreambleVtx.size() + fragBindingsAndShader.size());
+   shaderSource += ShaderPreambleVtx;
+   shaderSource += fragBindingsAndShader;
++  // Texture arrays: the source (an EFB copy texture) is a 2D array; read layer 0.
++  const bool srcArray = texture_arrays_enabled();
++  if (srcArray) {
++    const auto replace = [&](std::string_view from, std::string_view to) {
++      for (size_t pos = shaderSource.find(from); pos != std::string::npos; pos = shaderSource.find(from, pos + to.size()))
++        shaderSource.replace(pos, from.size(), to);
++    };
++    replace("var src: texture_2d<i32>;", "var src: texture_2d_array<i32>;");
++    replace("var src: texture_2d<f32>;", "var src: texture_2d_array<f32>;");
++    replace("textureLoad(src, coord, 0)", "textureLoad(src, coord, 0, 0)");
++  }
+ 
+   wgpu::ShaderSourceWGSL wgslSource{};
+   wgslSource.code = shaderSource.c_str();
+@@ -124,7 +135,7 @@ static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, wgpu
+           .texture =
+               wgpu::TextureBindingLayout{
+                   .sampleType = srcSampleType,
+-                  .viewDimension = wgpu::TextureViewDimension::e2D,
++                  .viewDimension = srcArray ? wgpu::TextureViewDimension::e2DArray : wgpu::TextureViewDimension::e2D,
+               },
+       },
+       wgpu::BindGroupLayoutEntry{
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index 029a3d0..6065767 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -9,9 +9,16 @@
+ #include "../gx/gx_fmt.hpp"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
++#include <mutex>
++#include <unordered_map>
+ #include <utility>
++#include <vector>
+ 
+ #include <fmt/format.h>
+ #include <tracy/Tracy.hpp>
+@@ -21,9 +28,241 @@ namespace aurora::gfx {
+ using webgpu::g_device;
+ using webgpu::g_queue;
+ 
++bool texture_arrays_enabled() noexcept {
++#ifdef MELEE_MIYOO_FLIP
++  static const bool enabled = [] {
++    const char* v = std::getenv("MELEE_FLIP_TEXTURE_ARRAYS");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++#else
++  return false;
++#endif
++}
++
+ namespace {
+ constexpr Module Log{"aurora::gfx"};
+ 
++// Layer pool for texture arrays. Slabs are 2D array textures; a GX texture
++// takes one layer and returns it when its TextureRef dies.
++struct ArraySlab {
++  wgpu::Texture texture;
++  wgpu::TextureView view;
++  uint32_t layers = 0;
++  std::vector<uint32_t> freeLayers;
++};
++struct ArrayKey {
++  uint32_t width, height, mips;
++  wgpu::TextureFormat format;
++  u32 gxFormat;
++  uint64_t groupKey;
++  bool operator==(const ArrayKey& o) const {
++    return width == o.width && height == o.height && mips == o.mips && format == o.format && gxFormat == o.gxFormat &&
++           groupKey == o.groupKey;
++  }
++};
++struct ArrayKeyHash {
++  size_t operator()(const ArrayKey& k) const {
++    uint64_t h = k.groupKey * 0x9E3779B97F4A7C15ull;
++    h ^= (uint64_t(k.width) << 40) ^ (uint64_t(k.height) << 20) ^ (uint64_t(k.mips) << 12) ^ uint64_t(k.format) ^
++         (uint64_t(k.gxFormat) << 48);
++    return static_cast<size_t>(h ^ (h >> 29));
++  }
++};
++std::mutex g_arrayMutex;
++std::unordered_map<ArrayKey, std::vector<std::shared_ptr<ArraySlab>>, ArrayKeyHash> g_arraySlabs;
++struct ArrayStats { uint32_t slabs = 0, layersUsed = 0; } g_arrayStats;
++
++bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format) noexcept;
++const wgpu::TextureBindingViewDimension* array_binding_chain();
++bool texture_atlas_enabled() noexcept;
++
++std::pair<std::shared_ptr<ArraySlab>, uint32_t> allocate_array_layer(const ArrayKey& key, const char* label) {
++  std::lock_guard lock{g_arrayMutex};
++  auto& slabs = g_arraySlabs[key];
++  for (auto& slab : slabs) {
++    if (!slab->freeLayers.empty()) {
++      const uint32_t layer = slab->freeLayers.back();
++      slab->freeLayers.pop_back();
++      ++g_arrayStats.layersUsed;
++      return {slab, layer};
++    }
++  }
++  // Grow geometrically per class (2, 4, 8, ... layers, at most ~2 MiB per slab
++  // and 32 layers) so memory tracks the textures actually in use.
++  const uint64_t layerBytes = std::max<uint64_t>(calc_texture_size(key.format, key.width, key.height, key.mips), 1);
++  const uint32_t byBudget = static_cast<uint32_t>(std::clamp<uint64_t>((2u << 20) / layerBytes, 1, 32));
++  // First slab: small textures start with room for neighbours (merges need
++  // textures of one class in one slab), large ones start alone.
++  // Adjacent draws often use same-class textures that landed in different
++  // slabs (30/frame on Fountain with 4/2/1); start larger for small classes.
++  const uint64_t area = uint64_t(key.width) * key.height;
++  uint32_t layers = area <= 64 * 64 ? 8 : area <= 128 * 128 ? 4 : area <= 256 * 256 ? 2 : 1;
++  if (!slabs.empty()) layers = std::min<uint32_t>(slabs.back()->layers * 2, 32);
++  layers = std::max<uint32_t>(std::min(layers, byBudget), 1);
++  auto slab = std::make_shared<ArraySlab>();
++  slab->layers = layers;
++  const std::string slabLabel = fmt::format("{} array x{}", label, layers);
++  const wgpu::TextureDescriptor textureDescriptor{
++      .nextInChain = array_binding_chain(),
++      .label = slabLabel.c_str(),
++      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
++      .dimension = wgpu::TextureDimension::e2D,
++      .size = {key.width, key.height, layers},
++      .format = key.format,
++      .mipLevelCount = key.mips,
++      .sampleCount = 1,
++  };
++  slab->texture = g_device.CreateTexture(&textureDescriptor);
++  wgpu::TextureViewDescriptor viewDescriptor{
++      .label = slabLabel.c_str(),
++      .format = key.format,
++      .dimension = wgpu::TextureViewDimension::e2DArray,
++      .mipLevelCount = key.mips,
++      .arrayLayerCount = layers,
++  };
++  wgpu::TextureComponentSwizzleDescriptor swizzle;
++  if (setup_swizzle(swizzle, key.gxFormat)) {
++    viewDescriptor.nextInChain = &swizzle;
++  }
++  slab->view = slab->texture.CreateView(&viewDescriptor);
++  for (uint32_t layer = layers; layer-- > 1;) slab->freeLayers.push_back(layer);
++  slabs.push_back(slab);
++  ++g_arrayStats.slabs;
++  ++g_arrayStats.layersUsed;
++  return {slab, 0u};
++}
++
++void release_array_layer(const std::shared_ptr<ArraySlab>& slab, uint32_t layer) {
++  std::lock_guard lock{g_arrayMutex};
++  slab->freeLayers.push_back(layer);
++  --g_arrayStats.layersUsed;
++}
++
++// ---- Atlas layers for clamp-wrapped single-mip textures -------------------
++bool texture_atlas_enabled() noexcept {
++  static const bool enabled = [] {
++    const char* v = std::getenv("MELEE_FLIP_TEXTURE_ATLAS");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return texture_arrays_enabled() && enabled;
++}
++constexpr uint32_t AtlasSize = 1024;
++constexpr uint32_t AtlasGutter = 1;
++struct AtlasShelf { uint32_t y, height, nextX; };
++struct AtlasLayer {
++  std::vector<AtlasShelf> shelves;
++  uint32_t nextY = 0;
++  uint32_t live = 0;
++};
++struct AtlasSlabInfo {
++  std::vector<AtlasLayer> layers; // one per array layer of the slab
++};
++std::unordered_map<ArraySlab*, AtlasSlabInfo> g_atlasInfo; // guarded by g_arrayMutex
++
++bool atlas_place(AtlasLayer& layer, uint32_t w, uint32_t h, uint32_t& x, uint32_t& y) {
++  const uint32_t cw = w + 2 * AtlasGutter, ch = h + 2 * AtlasGutter;
++  if (cw > AtlasSize || ch > AtlasSize) return false;
++  for (auto& shelf : layer.shelves) {
++    if (ch <= shelf.height && ch * 2 > shelf.height && shelf.nextX + cw <= AtlasSize) {
++      x = shelf.nextX; y = shelf.y; shelf.nextX += cw; ++layer.live; return true;
++    }
++  }
++  if (layer.nextY + ch > AtlasSize) return false;
++  layer.shelves.push_back({layer.nextY, ch, cw});
++  x = 0; y = layer.nextY; layer.nextY += ch; ++layer.live;
++  return true;
++}
++
++struct AtlasPlacement { std::shared_ptr<ArraySlab> slab; uint32_t layer, x, y; };
++AtlasPlacement allocate_atlas_rect(const ArrayKey& key, uint32_t w, uint32_t h, const char* label) {
++  std::lock_guard lock{g_arrayMutex};
++  auto& slabs = g_arraySlabs[key];
++  for (auto& slab : slabs) {
++    auto& info = g_atlasInfo[slab.get()];
++    info.layers.resize(slab->layers);
++    for (uint32_t l = 0; l < slab->layers; ++l) {
++      uint32_t x, y;
++      if (atlas_place(info.layers[l], w, h, x, y)) return {slab, l, x, y};
++    }
++  }
++  // New slab: layers double per class (1, 2, 4, ...), each 1024x1024.
++  const uint32_t layers = slabs.empty() ? 1u : std::min<uint32_t>(slabs.back()->layers * 2, 8);
++  auto slab = std::make_shared<ArraySlab>();
++  slab->layers = layers;
++  const std::string slabLabel = fmt::format("{} atlas x{}", label, layers);
++  const wgpu::TextureDescriptor textureDescriptor{
++      .nextInChain = array_binding_chain(),
++      .label = slabLabel.c_str(),
++      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
++      .dimension = wgpu::TextureDimension::e2D,
++      .size = {AtlasSize, AtlasSize, layers},
++      .format = key.format,
++      .mipLevelCount = 1,
++      .sampleCount = 1,
++  };
++  slab->texture = g_device.CreateTexture(&textureDescriptor);
++  wgpu::TextureViewDescriptor viewDescriptor{
++      .label = slabLabel.c_str(),
++      .format = key.format,
++      .dimension = wgpu::TextureViewDimension::e2DArray,
++      .mipLevelCount = 1,
++      .arrayLayerCount = layers,
++  };
++  wgpu::TextureComponentSwizzleDescriptor swizzle;
++  if (setup_swizzle(swizzle, key.gxFormat)) viewDescriptor.nextInChain = &swizzle;
++  slab->view = slab->texture.CreateView(&viewDescriptor);
++  slabs.push_back(slab);
++  ++g_arrayStats.slabs;
++  static unsigned atlasSlabs = 0;
++  ++atlasSlabs;
++  std::fprintf(stderr, "[flip-atlas] new slab layers=%u class_slabs=%zu total_atlas_slabs=%u fmt=%u gx=%x key=%llx (%ux%u)\n",
++               layers, slabs.size(), atlasSlabs, static_cast<unsigned>(key.format), key.gxFormat,
++               static_cast<unsigned long long>(key.groupKey), w, h);
++  auto& info = g_atlasInfo[slab.get()];
++  info.layers.resize(layers);
++  uint32_t x, y;
++  const bool placed = atlas_place(info.layers[0], w, h, x, y);
++  (void)placed;
++  return {slab, 0u, x, y};
++}
++
++void release_atlas_rect(const std::shared_ptr<ArraySlab>& slab, uint32_t layer) {
++  std::lock_guard lock{g_arrayMutex};
++  auto it = g_atlasInfo.find(slab.get());
++  if (it == g_atlasInfo.end() || layer >= it->second.layers.size()) return;
++  auto& l = it->second.layers[layer];
++  if (l.live > 0 && --l.live == 0) { l.shelves.clear(); l.nextY = 0; } // whole layer free again
++}
++
++// Copies a w x h image into a (w+2) x (h+2) buffer with replicated edges.
++void pad_with_gutter(const uint8_t* src, uint32_t srcBytesPerRow, uint32_t w, uint32_t h, uint32_t bpp,
++                     std::vector<uint8_t>& out, uint32_t& outBytesPerRow) {
++  const uint32_t pw = w + 2 * AtlasGutter, ph = h + 2 * AtlasGutter;
++  outBytesPerRow = pw * bpp;
++  out.resize(size_t(outBytesPerRow) * ph);
++  for (uint32_t y = 0; y < ph; ++y) {
++    const uint32_t sy = y < AtlasGutter ? 0 : y >= h + AtlasGutter ? h - 1 : y - AtlasGutter;
++    const uint8_t* srow = src + size_t(sy) * srcBytesPerRow;
++    uint8_t* drow = out.data() + size_t(y) * outBytesPerRow;
++    std::memcpy(drow + AtlasGutter * bpp, srow, size_t(w) * bpp);
++    for (uint32_t g = 0; g < AtlasGutter; ++g) {
++      std::memcpy(drow + g * bpp, srow, bpp);
++      std::memcpy(drow + (w + AtlasGutter + g) * bpp, srow + size_t(w - 1) * bpp, bpp);
++    }
++  }
++}
++
++// Compatibility mode (GLES): declare the texture's binding view dimension so
++// Dawn creates a GL_TEXTURE_2D_ARRAY object even for a single layer, matching
++// the array samplers in GX shaders without wasting a second layer.
++const wgpu::TextureBindingViewDimension* array_binding_chain() {
++  static const wgpu::TextureBindingViewDimension chain{wgpu::TextureBindingViewDimension::Init{
++      .textureBindingViewDimension = wgpu::TextureViewDimension::e2DArray,
++  }};
++  return webgpu::g_hasCoreFeatures ? nullptr : &chain;
++}
++
+ wgpu::Extent3D physical_size(wgpu::Extent3D size, TextureFormatInfo info) {
+   const uint32_t width = ((size.width + info.blockWidth - 1) / info.blockWidth) * info.blockWidth;
+   const uint32_t height = ((size.height + info.blockHeight - 1) / info.blockHeight) * info.blockHeight;
+@@ -97,11 +336,13 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
+ }
+ } // namespace
+ 
++static void upload_atlas_texture(TextureRef& ref, ArrayRef<uint8_t> data, const char* label);
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
+-                                    bool tlut, const char* label) noexcept {
++                                    bool tlut, const char* label, uint64_t groupKey) noexcept {
+   ZoneScoped;
+ 
+-  auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
++  // TLUTs are read by the palette conversion shaders as plain 2D textures.
++  auto handle = new_dynamic_texture_2d(width, height, mips, format, label, tlut ? UINT64_MAX : groupKey);
+   auto& ref = *handle;
+ 
+   ConvertedTexture converted;
+@@ -119,6 +360,10 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+     }
+   }
+ 
++  if (ref.atlas) {
++    upload_atlas_texture(ref, data, label);
++    return handle;
++  }
+   uint32_t offset = 0;
+   for (uint32_t mip = 0; mip < mips; ++mip) {
+     const wgpu::Extent3D mipSize{
+@@ -137,6 +382,7 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+     const wgpu::TexelCopyTextureInfo dstView{
+         .texture = ref.texture,
+         .mipLevel = mip,
++        .origin = {0, 0, ref.layer},
+     };
+     if constexpr (UseTextureBuffer) {
+       queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
+@@ -156,7 +402,7 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+ }
+ 
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+-                                     const char* label) noexcept {
++                                     const char* label, uint64_t groupKey) noexcept {
+   ZoneScopedS(3);
+   const auto wgpuFormat = to_wgpu(gxFormat);
+   const wgpu::Extent3D size{
+@@ -164,6 +410,33 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
+       .height = height,
+       .depthOrArrayLayers = 1,
+   };
++  const auto formatInfo = format_info(wgpuFormat);
++  if (texture_atlas_enabled() && groupKey != UINT64_MAX && (groupKey & TextureAtlasEligible) && mips == 1 &&
++      formatInfo.blockWidth == 1 && formatInfo.blockHeight == 1 && width + 2 <= 1024 && height + 2 <= 1024) {
++    const ArrayKey key{1024, 1024, 1, wgpuFormat, gxFormat, groupKey};
++    auto placement = allocate_atlas_rect(key, width, height, label);
++    auto handle = std::make_shared<TextureRef>(placement.slab->texture, placement.slab->view, wgpu::TextureView{}, size,
++                                               wgpuFormat, mips, gxFormat);
++    handle->layer = placement.layer;
++    handle->atlas = true;
++    handle->atlasOffsetX = static_cast<float>(placement.x + 1) / 1024.f;
++    handle->atlasOffsetY = static_cast<float>(placement.y + 1) / 1024.f;
++    handle->atlasScaleX = static_cast<float>(width) / 1024.f;
++    handle->atlasScaleY = static_cast<float>(height) / 1024.f;
++    auto slab = placement.slab;
++    const uint32_t layer = placement.layer;
++    handle->onRelease = [slab, layer] { release_atlas_rect(slab, layer); };
++    return handle;
++  }
++  if (texture_arrays_enabled() && groupKey != UINT64_MAX) {
++    const ArrayKey key{width, height, mips, wgpuFormat, gxFormat, groupKey & ~TextureAtlasEligible};
++    auto [slab, layer] = allocate_array_layer(key, label);
++    auto handle = std::make_shared<TextureRef>(slab->texture, slab->view, wgpu::TextureView{}, size, wgpuFormat, mips,
++                                               gxFormat);
++    handle->layer = layer;
++    handle->onRelease = [slab, layer] { release_array_layer(slab, layer); };
++    return handle;
++  }
+   const wgpu::TextureDescriptor textureDescriptor{
+       .label = label,
+       .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+@@ -190,18 +463,18 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
+                                       mips, gxFormat);
+ }
+ 
+-TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
+-  ZoneScoped;
+-
+-  const auto wgpuFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
++static TextureHandle new_sampled_target(uint32_t width, uint32_t height, wgpu::TextureFormat wgpuFormat, u32 gxFormat,
++                                        wgpu::TextureUsage usage, const char* label) noexcept {
++  const bool arrays = texture_arrays_enabled();
+   const wgpu::Extent3D size{
+       .width = width,
+       .height = height,
+       .depthOrArrayLayers = 1,
+   };
+   const wgpu::TextureDescriptor textureDescriptor{
++      .nextInChain = arrays ? array_binding_chain() : nullptr,
+       .label = label,
+-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment,
++      .usage = usage,
+       .dimension = wgpu::TextureDimension::e2D,
+       .size = size,
+       .format = wgpuFormat,
+@@ -210,50 +483,70 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat,
+   };
+   auto texture = g_device.CreateTexture(&textureDescriptor);
+ 
+-  // Create texture view for color attachments
++  // Color attachment view: layer 0 as a 2D view. Sample view: the whole array
++  // when GX shaders sample arrays, else the same 2D view.
+   const auto viewLabel = fmt::format("{} view", label);
+-  wgpu::TextureViewDescriptor textureViewDescriptor{
++  wgpu::TextureViewDescriptor attachmentDescriptor{
+       .label = viewLabel.c_str(),
+       .format = wgpuFormat,
+       .dimension = wgpu::TextureViewDimension::e2D,
++      .arrayLayerCount = 1,
+   };
+-  auto attachmentTextureView = texture.CreateView(&textureViewDescriptor);
++  auto attachmentTextureView = texture.CreateView(&attachmentDescriptor);
+   wgpu::TextureView sampleTextureView = attachmentTextureView;
++  if (arrays) {
++    const auto sampleLabel = fmt::format("{} array view", label);
++    wgpu::TextureViewDescriptor sampleDescriptor{
++        .label = sampleLabel.c_str(),
++        .format = wgpuFormat,
++        .dimension = wgpu::TextureViewDimension::e2DArray,
++        .arrayLayerCount = 1,
++    };
++    sampleTextureView = texture.CreateView(&sampleDescriptor);
++  }
+   return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
+                                       std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
+ }
+ 
+-TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
++TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
+   ZoneScoped;
++  return new_sampled_target(width, height, webgpu::g_graphicsConfig.surfaceConfiguration.format, gxFormat,
++                            wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst |
++                                wgpu::TextureUsage::RenderAttachment,
++                            label);
++}
+ 
+-  const auto wgpuFormat = to_wgpu(gxFormat);
+-  const wgpu::Extent3D size{
+-      .width = width,
+-      .height = height,
+-      .depthOrArrayLayers = 1,
+-  };
+-  const wgpu::TextureDescriptor textureDescriptor{
+-      .label = label,
+-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = size,
+-      .format = wgpuFormat,
+-      .mipLevelCount = 1,
+-      .sampleCount = 1,
+-  };
+-  auto texture = g_device.CreateTexture(&textureDescriptor);
++TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
++  ZoneScoped;
++  return new_sampled_target(width, height, to_wgpu(gxFormat), gxFormat,
++                            wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment, label);
++}
+ 
+-  // Create texture view for color attachments
+-  const auto viewLabel = fmt::format("{} view", label);
+-  wgpu::TextureViewDescriptor textureViewDescriptor{
+-      .label = viewLabel.c_str(),
+-      .format = wgpuFormat,
+-      .dimension = wgpu::TextureViewDimension::e2D,
++// Atlas textures: level 0 only, padded with a replicated one-texel gutter and
++// written at the texture's cell in its layer.
++static void upload_atlas_texture(TextureRef& ref, ArrayRef<uint8_t> data, const char* label) {
++  const auto info = format_info(ref.format);
++  const uint32_t bpp = info.blockSize;
++  const uint32_t bytesPerRow = ref.size.width * bpp;
++  const size_t need = size_t(bytesPerRow) * ref.size.height;
++  CHECK(need <= data.size(), "{}: atlas texture expected {} bytes, got {}", label, need, data.size());
++  static thread_local std::vector<uint8_t> padded;
++  uint32_t paddedBytesPerRow = 0;
++  pad_with_gutter(data.data(), bytesPerRow, ref.size.width, ref.size.height, bpp, padded, paddedBytesPerRow);
++  const uint32_t x = static_cast<uint32_t>(std::lround(ref.atlasOffsetX * 1024.f)) - 1;
++  const uint32_t y = static_cast<uint32_t>(std::lround(ref.atlasOffsetY * 1024.f)) - 1;
++  const wgpu::Extent3D size{ref.size.width + 2, ref.size.height + 2, 1};
++  const wgpu::TexelCopyTextureInfo dstView{
++      .texture = ref.texture,
++      .mipLevel = 0,
++      .origin = {x, y, ref.layer},
+   };
+-  auto attachmentTextureView = texture.CreateView(&textureViewDescriptor);
+-  wgpu::TextureView sampleTextureView = attachmentTextureView;
+-  return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
+-                                      std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
++  if constexpr (UseTextureBuffer) {
++    queue_texture_upload_data(padded.data(), paddedBytesPerRow, size.height, dstView, size);
++  } else {
++    const wgpu::TexelCopyBufferLayout dataLayout{.bytesPerRow = paddedBytesPerRow, .rowsPerImage = size.height};
++    g_queue.WriteTexture(&dstView, padded.data(), padded.size(), &dataLayout, &size);
++  }
+ }
+ 
+ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+@@ -267,6 +560,10 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+       data = converted.data;
+     }
+   }
++  if (ref.atlas) {
++    upload_atlas_texture(ref, data, "write_texture");
++    return;
++  }
+ 
+   uint32_t offset = 0;
+   for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
+@@ -286,6 +583,7 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+     const wgpu::TexelCopyTextureInfo dstView{
+         .texture = ref.texture,
+         .mipLevel = mip,
++        .origin = {0, 0, ref.layer},
+     };
+     if constexpr (UseTextureBuffer) {
+       queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
+@@ -316,6 +614,13 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+     if (!mipsEnabled) {
+       mipFilter = wgpu::MipmapFilterMode::Nearest;
+     }
++  } else if (ref && ref->mipCount == 1 && mipFilter != wgpu::MipmapFilterMode::Undefined) {
++    // A single level: mip filtering and LOD clamps cannot change the result,
++    // so use the same sampler as a non-mipmapped texture (fewer sampler
++    // objects, and atlas/array classes merge).
++    mipFilter = wgpu::MipmapFilterMode::Undefined;
++    minLod = 0.f;
++    maxLod = 0.f;
+   } else if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
+     minLod = 0.f;
+     maxLod = 0.f;
+diff --git a/lib/gfx/texture.hpp b/lib/gfx/texture.hpp
+index 0a5ca83..3ae3745 100644
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <functional>
+ #include <dolphin/gx.h>
+ 
+ #include <utility>
+@@ -43,6 +45,18 @@ struct TextureRef {
+   u32 gxFormat;
+   bool hasArbitraryMips = false;
+   bool isReplacement = false;
++  // Texture arrays (Flip): this texture lives in `layer` of a shared 2D array
++  // texture; `sampleTextureView` is the array view shared by all its layers.
++  uint32_t layer = 0;
++  // Atlas placement (clamp-wrapped single-mip textures share 1024x1024 layers,
++  // each texture surrounded by a one-texel replicated gutter): sampling uses
++  // clamp(uv) * atlasScale + atlasOffset. atlas == false: identity.
++  bool atlas = false;
++  float atlasOffsetX = 0.f, atlasOffsetY = 0.f, atlasScaleX = 1.f, atlasScaleY = 1.f;
++  std::function<void()> onRelease;
++  ~TextureRef() {
++    if (onRelease) onRelease();
++  }
+ 
+   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
+              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
+@@ -55,10 +69,18 @@ struct TextureRef {
+   , gxFormat(gxFormat) {}
+ };
+ 
++// MELEE_FLIP_TEXTURE_ARRAYS (Flip, default on): GX-sampled textures are layers
++// of shared 2D array textures grouped by size/format/sampler (`groupKey`), so
++// draws that differ only by texture share a bind group and can merge.
++bool texture_arrays_enabled() noexcept;
++// groupKey bit 63: the texture is clamp-wrapped and single-mip and may share an
++// atlas layer with others of its class (MELEE_FLIP_TEXTURE_ATLAS, default on).
++constexpr uint64_t TextureAtlasEligible = 1ull << 63;
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+-                                    ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
++                                    ArrayRef<uint8_t> data, bool tlut, const char* label,
++                                    uint64_t groupKey = 0) noexcept;
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+-                                     const char* label) noexcept;
++                                     const char* label, uint64_t groupKey = 0) noexcept;
+ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index b0dce17..dcd4705 100644
+index b0dce17..5cc659f 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
-@@ -1,10 +1,19 @@
+@@ -1,20 +1,32 @@
 +#ifdef MELEE_MIYOO_FLIP
 +#include "flip_vertex.hpp"
 +#include "flip_resident.hpp"
@@ -3329,7 +5602,11 @@ index b0dce17..dcd4705 100644
  #include "gx.hpp"
  #include "pipeline.hpp"
  #include "regs.hpp"
-@@ -15,6 +24,8 @@
+ #include "shader_info.hpp"
+ #include "texture.hpp"
+ 
++#include <unordered_map>
+ #include <tracy/Tracy.hpp>
  
  #include <algorithm>
  #include <cmath>
@@ -3338,7 +5615,7 @@ index b0dce17..dcd4705 100644
  #include <cstdint>
  #include <span>
  #include <vector>
-@@ -23,6 +34,95 @@ namespace aurora::gx::fifo {
+@@ -23,6 +35,95 @@ namespace aurora::gx::fifo {
  namespace {
  constexpr Module Log{"aurora::gx::fifo"};
  
@@ -3434,7 +5711,7 @@ index b0dce17..dcd4705 100644
  u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
    u16 numIndices = 0;
    if (prim == GX_QUADS) {
-@@ -130,6 +230,7 @@ struct DrawCache {
+@@ -130,6 +231,7 @@ struct DrawCache {
    PipelineConfig config{};
    ShaderInfo shaderInfo{};
    gfx::PipelineRef pipelineRef{};
@@ -3442,7 +5719,7 @@ index b0dce17..dcd4705 100644
    GXBindGroups bindGroups{};
    uint64_t bindGeneration = 0;
    GXVtxFmt fmt = GX_MAX_VTXFMT;
-@@ -375,33 +476,116 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
+@@ -375,33 +477,130 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
    return vtxSize;
  }
  
@@ -3519,6 +5796,20 @@ index b0dce17..dcd4705 100644
 +  return h.digest();
 +}
 +#endif
++
++#ifdef MELEE_MIYOO_FLIP
++// Pipeline variant for point draws recorded into the half-res sprite pass:
++// same shader, premultiplied accumulation blend (FlipSpriteAccum).
++static gfx::PipelineRef flip_sprite_variant(const DrawCache& cache) {
++  static std::unordered_map<gfx::PipelineRef, gfx::PipelineRef> memo;
++  if (const auto it = memo.find(cache.pipelineRef); it != memo.end()) return it->second;
++  auto variant = cache.config;
++  variant.shaderConfig.flipFlags |= FlipSpriteAccum;
++  const auto ref = gfx::pipeline_ref(variant);
++  memo.emplace(cache.pipelineRef, ref);
++  return ref;
++}
++#endif
  
 +// Resolve pipeline, textures, uniforms and fog range for the current GX state.
 +// Shared by streamed draws and resident display-list draws.
@@ -3572,7 +5863,7 @@ index b0dce17..dcd4705 100644
      cache.fmt = fmt;
      cache.lineMode = lineMode;
      cache.hasPipeline = true;
-@@ -415,6 +599,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+@@ -415,20 +614,28 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
    const bool bindGroupsValid =
        (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
    if (!bindGroupsValid) {
@@ -3580,9 +5871,19 @@ index b0dce17..dcd4705 100644
 +    gfx::detail::flip_profile::Scope profile("texture_resolve_bind");
 +#endif
      const auto prevBindGroup = cache.bindGroups.textureBindGroup;
++    const auto prevRefChanges = texture::texture_ref_changes();
      resolve_sampled_textures(cache.shaderInfo);
      cache.bindGroups = build_bind_groups(cache.shaderInfo);
-@@ -428,7 +615,10 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+     cache.bindGeneration = texture::current_bind_generation();
+     state.dirty &= ~DirtyTextures;
+-    // For texture_size_bias uniform
+-    if (cache.bindGroups.textureBindGroup != prevBindGroup) {
++    // For texture_size_bias uniform (size, LOD bias and, with texture arrays,
++    // the layer: textures in one array share the bind group).
++    if (cache.bindGroups.textureBindGroup != prevBindGroup || texture::texture_ref_changes() != prevRefChanges) {
+       state.dirty |= DirtyUniform;
+     }
+   }
  
    const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
    if (!uniformValid) {
@@ -3594,7 +5895,7 @@ index b0dce17..dcd4705 100644
      state.dirty &= ~DirtyUniform;
    }
    if (cache.config.shaderConfig.fogRangeEnabled) {
-@@ -442,6 +632,118 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+@@ -442,6 +649,130 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
    immediates.fogRangeBase = cache.fogRange.offset / sizeof(u32);
  
    state.dirty &= ~DirtyImmediates;
@@ -3634,7 +5935,16 @@ index b0dce17..dcd4705 100644
 +    static const bool skipPoints=[] {const char* v=std::getenv("MELEE_FLIP_SKIP_POINTS");return v&&v[0]=='1';}();
 +    if(skipPoints&&lineMode==3) return;
 +    const unsigned record=(cache.uniformRange.offset % FlipUniformWindow)/FlipUniformStride;
-+    if(lineMode) {
++    // Instanced points: vtxCount stays the point count; each point is one
++    // instance of a shared 6-index quad, and merges add instances.
++    const bool instancedPoints=lineMode==3&&(cache.config.shaderConfig.flipFlags&FlipInstancedPoints);
++    // Half-res sprite pass: eligible point draws in a sprite-heavy frame render
++    // into the half-res target with the accumulation pipeline variant.
++    bool spriteAccum=false;
++    if(instancedPoints) spriteAccum=gfx::flip_sprite_point_draw(cache.config,vtxCount);
++    else gfx::flip_sprite_settle();
++    const gfx::PipelineRef drawPipeline=spriteAccum?flip_sprite_variant(cache):cache.pipelineRef;
++    if(lineMode&&!instancedPoints) {
 +      const uint32_t instances=lineMode==3 ? vtxCount : lineMode==1 ? vtxCount/2 : vtxCount-1;
 +      AURORA_ASSERT(instances<=16383,"Too many expanded GX lines/points");
 +      vtxCount=instances*4;
@@ -3644,7 +5954,7 @@ index b0dce17..dcd4705 100644
 +    bool merge=false;
 +    unsigned textureBank=0;
 +    if(!previous) ++sFlipBatchStats.noPreviousDraw;
-+    else if(previous->pipeline!=cache.pipelineRef) { ++sFlipBatchStats.pipeline; classify_flip_pipeline(cache.config); }
++    else if(previous->pipeline!=drawPipeline) { ++sFlipBatchStats.pipeline; classify_flip_pipeline(cache.config); }
 +    else if(previous->bindGroups.textureBindGroup==cache.bindGroups.textureBindGroup) merge=true;
 +    else if(previous->bindGroups.textureBindGroup && cache.bindGroups.textureBindGroup) {
 +      if(flip_texture_pairs_enabled()) {
@@ -3669,7 +5979,7 @@ index b0dce17..dcd4705 100644
 +    else if(merge && previous->immediateData.fogRangeBase!=immediates.fogRangeBase) { merge=false; ++sFlipBatchStats.fog; }
 +    else if(merge && previous->uniformRange.offset/FlipUniformWindow!=cache.uniformRange.offset/FlipUniformWindow) { merge=false; ++sFlipBatchStats.uniformWindow; }
 +    else if(merge && previous->vtxCount+vtxCount>65535) { merge=false; ++sFlipBatchStats.vertexLimit; }
-+    else if(merge && !gfx::flip_indices_follow(previous->idxRange)) { merge=false; ++sFlipBatchStats.indexGap; }
++    else if(merge && !instancedPoints && !gfx::flip_indices_follow(previous->idxRange)) { merge=false; ++sFlipBatchStats.indexGap; }
 +    if(merge) ++sFlipBatchStats.merged;
 +    vertRange=flip_push_vertices(prim,fmt,flipRaw.data(),flipRaw.size(),4,record,&cache.config.shaderConfig,textureBank);
 +    if(merge && previous->vertRange.offset+previous->vertRange.size!=vertRange.offset) {
@@ -3678,7 +5988,9 @@ index b0dce17..dcd4705 100644
 +    const uint16_t base=merge ? previous->vtxCount : 0;
 +    static ByteBuffer indices;
 +    indices.clear();
-+    if(!flipIndices.empty()) {
++    if(instancedPoints) {
++      if(!merge) indices.append(std::array<uint16_t,6>{0,1,3,3,2,0});
++    } else if(!flipIndices.empty()) {
 +      for(size_t i=0;i<flipIndices.size();i+=2) {
 +        uint16_t index;std::memcpy(&index,flipIndices.data()+i,2);
 +        AURORA_ASSERT(index<vtxCount,"GX index outside decoded vertices");
@@ -3695,14 +6007,15 @@ index b0dce17..dcd4705 100644
 +    cache.lastDrawFmt=fmt;
 +    if(merge) {
 +      previous->vertRange.size+=vertRange.size;
-+      previous->idxRange.size+=idxRange.size;
-+      previous->vtxCount+=vtxCount;previous->indexCount+=numIndices;
++      if(instancedPoints) previous->instanceCount+=vtxCount;
++      else { previous->idxRange.size+=idxRange.size; previous->indexCount+=numIndices; }
++      previous->vtxCount+=vtxCount;
 +      previous->resident&=~ResidentConstantRecord; // records now differ within the draw
 +      gfx::detail::increment_merged_draw_count();
 +    } else {
-+      gfx::push_draw_command(DrawData{.pipeline=cache.pipelineRef,.vertRange=vertRange,.idxRange=idxRange,
++      gfx::push_draw_command(DrawData{.pipeline=drawPipeline,.vertRange=vertRange,.idxRange=idxRange,
 +        .uniformRange=cache.uniformRange,.immediateData=immediates,.vtxCount=vtxCount,.indexCount=numIndices,
-+        .instanceCount=1,.bindGroups=cache.bindGroups,.dstAlpha=state.dstAlpha,
++        .instanceCount=instancedPoints?vtxCount:1u,.bindGroups=cache.bindGroups,.dstAlpha=state.dstAlpha,
 +        .resident=cache.constantRef?ResidentConstantRecord:0u});
 +    }
 +    sFlipPreviousPipeline=cache.config;
@@ -3713,7 +6026,7 @@ index b0dce17..dcd4705 100644
  
    uint32_t instanceCount = 1;
    if (prim == GX_LINES) {
-@@ -451,6 +753,21 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+@@ -451,6 +782,21 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
    } else if (prim == GX_POINTS) {
      instanceCount = vtxCount;
    }
@@ -3735,7 +6048,7 @@ index b0dce17..dcd4705 100644
    cache.lastDrawFmt = fmt;
    gfx::push_draw_command(DrawData{
        .pipeline = cache.pipelineRef,
-@@ -494,6 +811,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+@@ -494,6 +840,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
    if (totalVtxBytes > reader.remaining())
      UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
  
@@ -3749,7 +6062,7 @@ index b0dce17..dcd4705 100644
    const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                            prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
    auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-@@ -501,7 +825,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+@@ -501,7 +854,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
  
    // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
    const auto vertexData = reader.take(totalVtxBytes);
@@ -3764,7 +6077,7 @@ index b0dce17..dcd4705 100644
  
    // Try to merge with previous draw call
    if (canMerge) {
-@@ -547,6 +877,264 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
+@@ -547,6 +906,265 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
    draw_prim(prim, fmt, reader.read<u16>(), reader);
  }
  
@@ -3884,6 +6197,7 @@ index b0dce17..dcd4705 100644
 +void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) {
 +  auto& state = g_gxState;
 +  auto& cache = sDrawCache;
++  gfx::flip_sprite_settle();
 +  gfx::detail::flip_profile::Scope drawProfile("draw_prepare");
 +  DrawImmediateData immediates{.vtxStart = 0, .currentPnMtx = state.currentPnMtx};
 +  prepare_draw_state(GX_TRIANGLES, fmt, immediates);
@@ -4029,7 +6343,7 @@ index b0dce17..dcd4705 100644
  void handle_aurora(ByteReader& reader) noexcept {
    ZoneScoped;
    const u16 subCmd = reader.read<u16>();
-@@ -729,7 +1317,11 @@ void handle_aurora(ByteReader& reader) noexcept {
+@@ -729,7 +1347,11 @@ void handle_aurora(ByteReader& reader) noexcept {
      const size_t idxBytes = static_cast<size_t>(indexCount) * sizeof(u16);
      // Index data is always host-endian; push it to the GPU buffer as-is
      const auto indexData = reader.take(idxBytes);
@@ -4042,7 +6356,7 @@ index b0dce17..dcd4705 100644
      u32 vtxSize;
      if (g_gxState.lastVtxFmt == fmt) {
        vtxSize = g_gxState.lastVtxSize;
-@@ -738,10 +1330,40 @@ void handle_aurora(ByteReader& reader) noexcept {
+@@ -738,10 +1360,40 @@ void handle_aurora(ByteReader& reader) noexcept {
      }
      const u32 totalVtxBytes = vtxCount * vtxSize;
      const auto vertexData = reader.take(totalVtxBytes);
@@ -4084,7 +6398,7 @@ index b0dce17..dcd4705 100644
    } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
      auto label = reader.read_string();
      gfx::push_debug_group(std::move(label));
-@@ -758,6 +1380,55 @@ void handle_aurora(ByteReader& reader) noexcept {
+@@ -758,6 +1410,55 @@ void handle_aurora(ByteReader& reader) noexcept {
  }
  
  void clear_draw_cache() noexcept {
@@ -4875,10 +7189,10 @@ index 0000000..a40259e
 +} // namespace aurora::gx::resident
 diff --git a/lib/gx/flip_uber.cpp b/lib/gx/flip_uber.cpp
 new file mode 100644
-index 0000000..2c6711f
+index 0000000..97a6312
 --- /dev/null
 +++ b/lib/gx/flip_uber.cpp
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,342 @@
 +#include "flip_uber.hpp"
 +
 +#ifdef MELEE_MIYOO_FLIP
@@ -4914,7 +7228,7 @@ index 0000000..2c6711f
 +    const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
 +    viewportBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
 +  }
-+  return {width, height, tex.texObj.lod_bias() + viewportBias, 0.f};
++  return {width, height, tex.texObj.lod_bias() + viewportBias, tex.ref ? static_cast<float>(tex.ref->layer) : 0.f};
 +}
 +
 +u32 pack_tev_op(const TevOp& op) noexcept {
@@ -4948,7 +7262,7 @@ index 0000000..2c6711f
 +void flip_uber_canonicalize(ShaderConfig& config) noexcept {
 +  // A native specialized program must retain the GX material state in its key.
 +  if (flip_native_specialized_enabled()) return;
-+  const u8 flags = config.flipFlags;
++  const u16 flags = config.flipFlags;
 +  const u32 tevStageCount = config.tevStageCount;
 +  config = {};
 +  config.flipFlags = flags;
@@ -5053,20 +7367,23 @@ index 0000000..2c6711f
 +
 +std::string build_flip_uber_shader_source(bool texturePairs) noexcept {
 +  std::string bindings;
++  const bool arrays = gfx::texture_arrays_enabled();
++  const char* texType = arrays ? "texture_2d_array<f32>" : "texture_2d<f32>";
++  const char* layerArg = arrays ? " layer," : "";
 +  for (u32 i = 0; i < MaxTextures; ++i) {
-+    bindings += fmt::format("@group(2) @binding({0}) var tex{1}: texture_2d<f32>;\n"
-+                            "@group(2) @binding({2}) var samp{1}: sampler;\n", i * 2, i, i * 2 + 1);
++    bindings += fmt::format("@group(2) @binding({0}) var tex{1}: {3};\n"
++                            "@group(2) @binding({2}) var samp{1}: sampler;\n", i * 2, i, i * 2 + 1, texType);
 +    if (texturePairs)
-+      bindings += fmt::format("@group(2) @binding({0}) var tex{1}b: texture_2d<f32>;\n"
-+                              "@group(2) @binding({2}) var samp{1}b: sampler;\n", 16 + i * 2, i, 17 + i * 2);
++      bindings += fmt::format("@group(2) @binding({0}) var tex{1}b: {3};\n"
++                              "@group(2) @binding({2}) var samp{1}b: sampler;\n", 16 + i * 2, i, 17 + i * 2, texType);
 +  }
 +  std::string sampleCases;
 +  for (u32 i = 0; i < MaxTextures; ++i) {
-+    sampleCases += fmt::format("case {0}u: {{ if (bank == 0u) {{ return textureSampleGrad(tex{0}, samp{0}, uv, dx, dy); }}", i);
++    sampleCases += fmt::format("case {0}u: {{ if (bank == 0u) {{ return textureSampleGrad(tex{0}, samp{0}, uv,{1} dx, dy); }}", i, layerArg);
 +    if (texturePairs)
-+      sampleCases += fmt::format(" return textureSampleGrad(tex{0}b, samp{0}b, uv, dx, dy);", i);
++      sampleCases += fmt::format(" return textureSampleGrad(tex{0}b, samp{0}b, uv,{1} dx, dy);", i, layerArg);
 +    else
-+      sampleCases += fmt::format(" return textureSampleGrad(tex{0}, samp{0}, uv, dx, dy);", i);
++      sampleCases += fmt::format(" return textureSampleGrad(tex{0}, samp{0}, uv,{1} dx, dy);", i, layerArg);
 +    sampleCases += " }\n";
 +  }
 +
@@ -5155,7 +7472,7 @@ index 0000000..2c6711f
 +    case 3u:{{return value<=threshold;}}case 4u:{{return value>threshold;}}case 5u:{{return value!=threshold;}}
 +    case 6u:{{return value>=threshold;}}default:{{return true;}}}}
 +}}
-+fn sample_texture(id:u32,bank:u32,uv:vec2f,bias:f32)->vec4f {{
++fn sample_texture(id:u32,bank:u32,uv:vec2f,layer:i32,bias:f32)->vec4f {{
 +  let scale=exp2(bias); let dx=dpdx(uv)*scale; let dy=dpdy(uv)*scale;
 +  switch id {{ {1} default: {{return vec4f(1.0);}} }}
 +}}
@@ -5199,7 +7516,7 @@ index 0000000..2c6711f
 +@fragment fn fs_main(in:VertexOutput)->@location(0) vec4f{{record_index=in.rec;texture_bank=in.bank;var regs=table[record_index].value.tevreg;var cm=0u;var am=0u;var lastc=0u;var lasta=0u;
 + let coords=array<vec3f,8>(in.tc0,in.tc1,in.tc2,in.tc3,in.tc4,in.tc5,in.tc6,in.tc7);let rast=array<vec4f,2>(in.clr0,in.clr1);let count=word(0u)&255u;
 + for(var i=0u;i<6u;i++){{if(i>=count){{break;}}let w0=word(24u+i*3u);let w1=word(25u+i*3u);let w2=word(26u+i*3u);
-+  let tcid=(w2>>10u)&15u;let texid=(w2>>14u)&15u;var sample=vec4f(1);if(texid<8u&&tcid<8u){{let tc=coords[tcid];let ty=word(8u+tcid)&255u;let uv=select(tc.xy,tc.xy/tc.z,ty==0u);sample=sample_texture(texid,texture_bank,uv,table[record_index].value.tex_size_bias[texid].z);}}sample=swap_color(sample,(w2>>28u)&3u);
++  let tcid=(w2>>10u)&15u;let texid=(w2>>14u)&15u;var sample=vec4f(1);if(texid<8u&&tcid<8u){{let tc=coords[tcid];let ty=word(8u+tcid)&255u;let uv=select(tc.xy,tc.xy/tc.z,ty==0u);sample=sample_texture(texid,texture_bank,uv,i32(table[record_index].value.tex_size_bias[texid].w),table[record_index].value.tex_size_bias[texid].z);}}sample=swap_color(sample,(w2>>28u)&3u);
 +  let chan=(w2>>18u)&255u;var rv=vec4f(0);if(chan<6u){{rv=rast[chan&1u];}}rv=swap_color(rv,(w2>>26u)&3u);
 +  let kc=konst_color(w2&31u);let ka=konst_alpha((w2>>5u)&31u);let ca=array<u32,4>(w0&15u,(w0>>4u)&15u,(w0>>8u)&15u,(w0>>12u)&15u);let aa=array<u32,4>((w0>>16u)&7u,(w0>>19u)&7u,(w0>>22u)&7u,(w0>>25u)&7u);
 +  var a=color_arg(ca[0],regs,sample,rv,kc);var b=color_arg(ca[1],regs,sample,rv,kc);var c=color_arg(ca[2],regs,sample,rv,kc);let d=color_arg(ca[3],regs,sample,rv,kc);
@@ -5264,10 +7581,10 @@ index 0000000..5dc3710
 +#endif
 diff --git a/lib/gx/flip_vertex.hpp b/lib/gx/flip_vertex.hpp
 new file mode 100644
-index 0000000..c5f25c7
+index 0000000..b4049dc
 --- /dev/null
 +++ b/lib/gx/flip_vertex.hpp
-@@ -0,0 +1,1009 @@
+@@ -0,0 +1,1011 @@
 +#pragma once
 +#include <fmt/format.h>
 +#include <string>
@@ -5990,7 +8307,7 @@ index 0000000..c5f25c7
 +}
 +
 +inline const FlipLoader& flip_loader(const ShaderConfig& c) {
-+  struct Key { std::array<AttrConfig, MaxVtxAttr> attrs; u8 vtxStride, lineMode, flipFlags; };
++  struct Key { std::array<AttrConfig, MaxVtxAttr> attrs; u8 vtxStride, lineMode; u16 flipFlags; };
 +  static_assert(std::has_unique_object_representations_v<AttrConfig>);
 +  Key key{c.attrs, c.vtxStride, c.lineMode, c.flipFlags};
 +  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
@@ -6148,7 +8465,9 @@ index 0000000..c5f25c7
 +  const auto& layout = loader.layout;
 +#ifdef MELEE_MIYOO_FLIP
 +  static const bool specialized=[] {const char* v=std::getenv("MELEE_FLIP_LOADERS");return !v||std::strcmp(v,"0");}();
-+  if(specialized&&loader.ok&&!cacheDraw&&!c.lineMode) {
++  // Instanced points keep one record per point; only lines and non-instanced points expand to quads.
++  const bool expand=c.lineMode&&!(c.lineMode==3&&(c.flipFlags&FlipInstancedPoints));
++  if(specialized&&loader.ok&&!cacheDraw&&!expand) {
 +    // Specialized loader: decode once, directly into immutable frame storage.
 +    u8* destination=nullptr;
 +    const auto range=gfx::map_flip_verts(count*layout.stride,alignment,destination);
@@ -6158,7 +8477,7 @@ index 0000000..c5f25c7
 +    return range;
 +  }
 +  // Points (lineMode 3) carry no flip_line attribute; lines (1, 2) need it.
-+  if(specialized&&loader.ok&&!cacheDraw&&c.lineMode&&loader.hasMatrices&&loader.posOffset!=0xFFFF&&(c.lineMode==3||loader.lineOffset!=0xFFFF)) {
++  if(specialized&&loader.ok&&!cacheDraw&&expand&&loader.hasMatrices&&loader.posOffset!=0xFFFF&&(c.lineMode==3||loader.lineOffset!=0xFFFF)) {
 +    // Lines/points: decode the GX vertices once with the specialized loader, then
 +    // expand each segment/point into four quad corners by copying whole records.
 +    // Same output as the reference expansion below (corner in matrices.z bits
@@ -6202,7 +8521,7 @@ index 0000000..c5f25c7
 +    return range;
 +  }
 +  static const bool direct=[] {const char* s=std::getenv("MELEE_FLIP_DECODE_DIRECT");return s&&!std::strcmp(s,"1");}();
-+  if(direct&&!cacheDraw&&!c.lineMode) {
++  if(direct&&!cacheDraw&&!expand) {
 +    u8* destination=nullptr;
 +    const auto range=gfx::map_flip_verts(count*layout.stride,alignment,destination);
 +    if(!destination) return {};
@@ -6233,7 +8552,7 @@ index 0000000..c5f25c7
 +    }
 +    ++cache.misses;
 +  }
-+  if(!c.lineMode) {
++  if(!expand) {
 +    flip_decode_packed(c,layout,raw,count,packed,g_gxState.arrays,g_gxState.currentPnMtx);
 +    if(cacheDraw) cache.store(key,packed);
 +    return upload();
@@ -6245,7 +8564,7 @@ index 0000000..c5f25c7
 +    for (size_t i = 0; i < count; ++i)
 +      decoded[i] = flip_decode_vertex(c, raw + i * c.vtxStride, g_gxState.arrays, g_gxState.currentPnMtx);
 +  }
-+  if (c.lineMode) {
++  if (expand) {
 +    const size_t instances = c.lineMode == 3 ? count : c.lineMode == 1 ? count / 2 : count ? count - 1 : 0;
 +    AURORA_ASSERT(instances <= 16383, "Too many expanded GX lines/points");
 +    expanded.resize(instances * 4);
@@ -6263,7 +8582,7 @@ index 0000000..c5f25c7
 +      }
 +    }
 +  }
-+  auto& vertices = c.lineMode ? expanded : decoded;
++  auto& vertices = expand ? expanded : decoded;
 +  packed.resize(vertices.size() * layout.stride);
 +  for (size_t i = 0; i < vertices.size(); ++i) {
 +    const auto* source = reinterpret_cast<const u8*>(&vertices[i]);
@@ -6278,7 +8597,7 @@ index 0000000..c5f25c7
 +}
 +} // namespace aurora::gx
 diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
-index b12b327..b6a352c 100644
+index b12b327..11b2f68 100644
 --- a/lib/gx/gx.cpp
 +++ b/lib/gx/gx.cpp
 @@ -1,3 +1,7 @@
@@ -6289,7 +8608,18 @@ index b12b327..b6a352c 100644
  #include "gx.hpp"
  
  #include "pipeline.hpp"
-@@ -42,6 +46,16 @@ wgpu::BindGroupLayout sTextureBindGroupLayout;
+@@ -15,6 +19,10 @@
+ #include <absl/container/flat_hash_map.h>
+ #include <tracy/Tracy.hpp>
+ 
++#include <unordered_set>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
+ #include <atomic>
+ #include <bit>
+ #include <cfloat>
+@@ -42,6 +50,16 @@ wgpu::BindGroupLayout sTextureBindGroupLayout;
  wgpu::BindGroupLayout sSamplerBindGroupLayout;
  wgpu::PipelineLayout sPipelineLayout;
  
@@ -6306,7 +8636,59 @@ index b12b327..b6a352c 100644
  std::atomic<int> sPendingViewportPolicy{-1};
  
  template <typename T>
-@@ -366,6 +380,12 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+@@ -313,6 +331,14 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
+ 
+ const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
+ 
++bool flip_instanced_points_enabled() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("MELEE_FLIP_INSTANCED_POINTS");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++}
++
+ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+                                     wgpu::ShaderModule shader, const char* label) noexcept {
+   ZoneScoped;
+@@ -327,12 +353,34 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
+       .depthBiasSlopeScale = depthBiasSlopeScale,
+       .depthBiasClamp = depthBiasClamp,
+   };
+-  const auto blendState =
++  auto blendState =
+       to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
++#ifdef MELEE_MIYOO_FLIP
++  // Half-res sprite accumulation: rgb blends as the game asked (src*a + dst*f),
++  // alpha accumulates coverage (1 - product of (1 - a)) for dst factor
++  // INVSRCALPHA and stays untouched for dst factor ONE.
++  const bool spriteAccum = (config.shaderConfig.flipFlags & FlipSpriteAccum) != 0;
++  if (spriteAccum) {
++    if (config.blendMode == GX_BM_NONE) {
++      // Opaque (alpha-tested) sprites: store premultiplied color and coverage.
++      blendState.color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::SrcAlpha, .dstFactor = wgpu::BlendFactor::Zero};
++      blendState.alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One, .dstFactor = wgpu::BlendFactor::Zero};
++    } else {
++      const bool attenuates = config.blendFacDst == GX_BL_INVSRCALPHA;
++      blendState.alpha = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = attenuates ? wgpu::BlendFactor::One : wgpu::BlendFactor::Zero,
++          .dstFactor = attenuates ? wgpu::BlendFactor::OneMinusSrcAlpha : wgpu::BlendFactor::One,
++      };
++    }
++  }
++#else
++  constexpr bool spriteAccum = false;
++#endif
+   const std::array colorTargets{wgpu::ColorTargetState{
+       .format = g_graphicsConfig.surfaceConfiguration.format,
+       .blend = &blendState,
+-      .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
++      .writeMask = spriteAccum ? wgpu::ColorWriteMask::All : to_write_mask(config.colorUpdate, config.alphaUpdate),
+   }};
+   const wgpu::FragmentState fragmentState{
+       .module = shader,
+@@ -366,6 +414,12 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
  
    const auto& vtxFmt = g_gxState.vtxFmts[fmt];
    config.shaderConfig = {};
@@ -6319,7 +8701,20 @@ index b12b327..b6a352c 100644
    config.shaderConfig.fogType = g_gxState.fog.type;
    config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
    u8 vtxOffset = 0;
-@@ -445,6 +465,10 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+@@ -416,6 +470,12 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+     config.shaderConfig.lineMode = 2;
+   } else if (primitive == GX_POINTS) {
+     config.shaderConfig.lineMode = 3;
++#ifdef MELEE_MIYOO_FLIP
++    constexpr u32 needed = FlipVertexInput | FlipBatchedDraws;
++    if ((config.shaderConfig.flipFlags & needed) == needed && flip_instanced_points_enabled()) {
++      config.shaderConfig.flipFlags |= FlipInstancedPoints;
++    }
++#endif
+   } else {
+     config.shaderConfig.lineMode = 0;
+   }
+@@ -445,6 +505,10 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
    if (g_gxState.alphaCompare) {
      config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
    }
@@ -6330,7 +8725,7 @@ index b12b327..b6a352c 100644
    const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
    const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
    config = {
-@@ -468,6 +492,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+@@ -468,6 +532,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
  }
  
  GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
@@ -6340,7 +8735,7 @@ index b12b327..b6a352c 100644
    ZoneScoped;
  
    if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
-@@ -476,14 +503,33 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
+@@ -476,14 +543,33 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
    }
  
    // Using C WGPU types instead of C++ wrappers to avoid destructor overhead
@@ -6380,7 +8775,7 @@ index b12b327..b6a352c 100644
        textureEntry.textureView = tex.ref->sampleTextureView.Get();
        samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
      } else {
-@@ -494,18 +540,25 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
+@@ -494,25 +580,53 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
    const WGPUBindGroupDescriptor textureBindGroupDescriptor{
        .label = {"GX Texture Bind Group", WGPU_STRLEN},
        .layout = sTextureBindGroupLayout.Get(),
@@ -6389,6 +8784,26 @@ index b12b327..b6a352c 100644
        .entries = textureEntries.data(),
    };
 +  const auto textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor);
++#ifdef MELEE_MIYOO_FLIP
++  // Diagnostic (MELEE_FLIP_TEXGROUP_TRACE=1): describe each distinct texture
++  // bind group once so draw traces can be correlated with texture classes.
++  static const bool traceGroups = [] { const char* v = std::getenv("MELEE_FLIP_TEXGROUP_TRACE"); return v && v[0] == '1'; }();
++  if (traceGroups) {
++    static std::unordered_set<uint64_t> printed;
++    if (printed.insert(static_cast<uint64_t>(textureBindGroup)).second) {
++      std::string text = fmt::format("[flip-texgroup] id={:x}", static_cast<uint64_t>(textureBindGroup));
++      for (u32 i = 0; i < MaxTextures; ++i) {
++        const auto& tex = g_gxState.textures[i];
++        const bool sampled = info.sampledTextures[i] || info.sampledIndTextures[i];
++        if (!tex || !sampled) continue;
++        text += fmt::format(" s{}={}x{}m{}f{:x}g{:x}mode0={:x}mode1={:x}L{}", i, tex.texObj.width(), tex.texObj.height(),
++                            tex.texObj.mip_count(), static_cast<unsigned>(tex.ref->format), tex.texObj.format(),
++                            tex.texObj.mode0, tex.texObj.mode1, tex.ref->layer);
++      }
++      std::fprintf(stderr, "%s\n", text.c_str());
++    }
++  }
++#endif
    return {
 -      .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
 +      .textureBindGroup = textureBindGroup,
@@ -6410,7 +8825,16 @@ index b12b327..b6a352c 100644
        textureEntries[i * 2] = {
            .binding = i * 2,
            .visibility = wgpu::ShaderStage::Fragment,
-@@ -523,7 +576,7 @@ void initialize() noexcept {
+           .texture =
+               {
+                   .sampleType = wgpu::TextureSampleType::Float,
+-                  .viewDimension = wgpu::TextureViewDimension::e2D,
++                  .viewDimension = gfx::texture_arrays_enabled() ? wgpu::TextureViewDimension::e2DArray
++                                                                 : wgpu::TextureViewDimension::e2D,
+               },
+       };
+       textureEntries[i * 2 + 1] = {
+@@ -523,7 +637,7 @@ void initialize() noexcept {
      }
      const wgpu::BindGroupLayoutDescriptor descriptor{
          .label = "GX Texture Bind Group Layout",
@@ -6419,8 +8843,30 @@ index b12b327..b6a352c 100644
          .entries = textureEntries.data(),
      };
      sTextureBindGroupLayout = g_device.CreateBindGroupLayout(&descriptor);
-@@ -543,8 +596,14 @@ void initialize() noexcept {
-     sEmptyTextureView = sEmptyTexture.CreateView();
+@@ -533,18 +647,33 @@ void initialize() noexcept {
+     sEmptySampler = gfx::sampler_ref(descriptor);
+   }
+   {
+-    constexpr wgpu::TextureDescriptor descriptor{
++    const bool arrays = gfx::texture_arrays_enabled();
++    const wgpu::TextureBindingViewDimension arrayChain{wgpu::TextureBindingViewDimension::Init{
++        .textureBindingViewDimension = wgpu::TextureViewDimension::e2DArray,
++    }};
++    const wgpu::TextureDescriptor descriptor{
++        .nextInChain = arrays && !webgpu::g_hasCoreFeatures ? &arrayChain : nullptr,
+         .label = "Empty texture",
+         .usage = wgpu::TextureUsage::TextureBinding,
+-        .size = {1, 1},
++        .size = {1, 1, 1},
+         .format = wgpu::TextureFormat::RGBA8Unorm,
+     };
+     sEmptyTexture = g_device.CreateTexture(&descriptor);
+-    sEmptyTextureView = sEmptyTexture.CreateView();
++    const wgpu::TextureViewDescriptor viewDescriptor{
++        .label = "Empty texture view",
++        .dimension = arrays ? wgpu::TextureViewDimension::e2DArray : wgpu::TextureViewDimension::e2D,
++    };
++    sEmptyTextureView = sEmptyTexture.CreateView(&viewDescriptor);
    }
    {
 -    std::array<wgpu::BindGroupEntry, MaxTextures * 2> entries;
@@ -6436,7 +8882,7 @@ index b12b327..b6a352c 100644
        entries[i * 2] = {
            .binding = i * 2,
            .textureView = sEmptyTextureView,
-@@ -557,7 +616,7 @@ void initialize() noexcept {
+@@ -557,7 +686,7 @@ void initialize() noexcept {
      const wgpu::BindGroupDescriptor desc{
          .label = "GX Empty Texture Bind Group",
          .layout = sTextureBindGroupLayout,
@@ -6446,7 +8892,7 @@ index b12b327..b6a352c 100644
      };
      g_emptyTextureBindGroup = g_device.CreateBindGroup(&desc);
 diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
-index a97b987..387cf74 100644
+index a97b987..33b2a98 100644
 --- a/lib/gx/gx.hpp
 +++ b/lib/gx/gx.hpp
 @@ -66,7 +66,7 @@ constexpr u32 MaxIndTexMtxs = 3;
@@ -6458,11 +8904,11 @@ index a97b987..387cf74 100644
  constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
  
  enum DirtyFlag : u8 {
-@@ -486,13 +486,22 @@ struct AttrConfig {
+@@ -486,6 +486,20 @@ struct AttrConfig {
    bool le = true;
    bool nbt3 = false; // GX_NRM_NBT3
  };
-+enum FlipShaderFlags : u8 {
++enum FlipShaderFlags : u16 {
 +  FlipVertexInput = 1,
 +  FlipUniformTable = 2,
 +  FlipCompactVertices = 4,
@@ -6470,20 +8916,26 @@ index a97b987..387cf74 100644
 +  FlipTexturePairs = 16,
 +  FlipUberShader = 32,
 +  FlipConstantRecord = 64, // uniform record bound per draw; no dynamic UBO indexing
++  FlipInstancedPoints = 128, // GX_POINTS: one record per point, quad corner from the vertex index
++  FlipSpriteAccum = 256, // half-res sprite pass: premultiplied accumulation blend, alpha written
 +};
++// MELEE_FLIP_INSTANCED_POINTS (default on): GX_POINTS draws step their vertex
++// attributes per instance instead of expanding every point into four records.
++bool flip_instanced_points_enabled();
  struct ShaderConfig {
    u8 fogType = GX_FOG_NONE;
    u8 vtxStride = 0;
-   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
+@@ -493,6 +507,8 @@ struct ShaderConfig {
    u8 fogRangeEnabled : 1 = false;
    u8 pad1 : 5 = 0;
--  u8 pad2 = 0;
-+  u8 flipFlags = 0; // FlipShaderFlags; zero on other backends.
+   u8 pad2 = 0;
++  u16 flipFlags = 0; // FlipShaderFlags; zero on other backends.
++  u16 pad3 = 0;
    std::array<AttrConfig, MaxVtxAttr> attrs;
    std::array<TevSwap, MaxTevSwap> tevSwapTable;
    std::array<TevStage, MaxTevStages> tevStages;
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index 0c3631c..ef919e8 100644
+index 0c3631c..76a09fb 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
 @@ -1,3 +1,7 @@
@@ -6494,7 +8946,7 @@ index 0c3631c..ef919e8 100644
  #include "pipeline.hpp"
  
  #include "../gfx/encoding.hpp"
-@@ -9,15 +13,61 @@
+@@ -9,15 +13,62 @@
  #include "shader_info.hpp"
  
  #include <tracy/Tracy.hpp>
@@ -6546,7 +8998,8 @@ index 0c3631c..ef919e8 100644
 +  if(config.shaderConfig.flipFlags & FlipVertexInput) {
 +    const auto attrs=flip_vertex_attributes(config.shaderConfig);
 +    const wgpu::VertexAttribute recordAttribute{.format=wgpu::VertexFormat::Uint32,.offset=0,.shaderLocation=15};
-+    const std::array buffers{wgpu::VertexBufferLayout{.stepMode=wgpu::VertexStepMode::Vertex,
++    const bool instancedPoints=(config.shaderConfig.flipFlags & FlipInstancedPoints)!=0;
++    const std::array buffers{wgpu::VertexBufferLayout{.stepMode=instancedPoints?wgpu::VertexStepMode::Instance:wgpu::VertexStepMode::Vertex,
 +      .arrayStride=attrs.stride,.attributeCount=attrs.count,.attributes=attrs.attributes.data()},
 +      wgpu::VertexBufferLayout{.stepMode=wgpu::VertexStepMode::Vertex,.arrayStride=4,.attributeCount=1,.attributes=&recordAttribute}};
 +    const bool recordSlot=(config.shaderConfig.flipFlags & FlipBatchedDraws) && config.shaderConfig.lineMode==0;
@@ -6556,7 +9009,7 @@ index 0c3631c..ef919e8 100644
    return build_pipeline(config, {}, shader, label.c_str());
  }
  
-@@ -27,13 +77,45 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+@@ -27,13 +78,45 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
    }
  
    const auto& resources = gfx::detail::resources();
@@ -6677,10 +9130,10 @@ index 0c3925b..1e31965 100644
    }
  }
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index 92f358b..7a9449a 100644
+index 92f358b..a6e1f2b 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
-@@ -1,3 +1,7 @@
+@@ -1,11 +1,18 @@
 +#ifdef MELEE_MIYOO_FLIP
 +#include "flip_vertex.hpp"
 +#include "flip_uber.hpp"
@@ -6688,15 +9141,18 @@ index 92f358b..7a9449a 100644
  #include "../gfx/hash.hpp"
  #include "../gfx/types.hpp"
  
-@@ -6,6 +10,7 @@
+ #include "../internal.hpp"
+ #include "../webgpu/gpu.hpp"
  #include "gx.hpp"
++#include "../gfx/texture.hpp"
  #include "gx_fmt.hpp"
  #include "shader_info.hpp"
++#include <cctype>
 +#include <cstdlib>
  
  #include <dolphin/gx/GXEnum.h>
  
-@@ -688,6 +693,18 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
+@@ -688,6 +695,18 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
  }
  
  auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -> std::string {
@@ -6715,7 +9171,7 @@ index 92f358b..7a9449a 100644
    const auto& mapping = config.attrs[attr];
    if (mapping.attrType == GX_NONE) {
      return vtx_attr(config, attr);
-@@ -749,6 +766,9 @@ enum class NbtSlice : u8 {
+@@ -749,6 +768,9 @@ enum class NbtSlice : u8 {
  };
  
  auto attr_load_nbt_slice(const ShaderConfig& config, NbtSlice slice, std::string_view vidx) -> std::string {
@@ -6725,7 +9181,7 @@ index 92f358b..7a9449a 100644
    const auto& mapping = config.attrs[GX_VA_NRM];
    if (mapping.attrType == GX_NONE || mapping.cnt != 9) {
      Log.fatal("attr_load_nbt_slice: GX_TG_BINRM/TANGENT requires GX_NRM_NBT or GX_NRM_NBT3");
-@@ -872,6 +892,10 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
+@@ -872,6 +894,10 @@ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
  
  std::string build_shader_source(const ShaderConfig& config) noexcept {
    ZoneScoped;
@@ -6736,7 +9192,7 @@ index 92f358b..7a9449a 100644
    const auto hash = xxh3_hash(config);
    const auto info = build_shader_info(config);
    if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
-@@ -950,7 +974,29 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+@@ -950,7 +976,37 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
    std::string vtxXfrAttrsPre;
    std::string vtxXfrAttrs;
    size_t vtxOutIdx = 0;
@@ -6764,10 +9220,18 @@ index 92f358b..7a9449a 100644
 +    vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) flip_texture_bank_out: u32,",vtxOutIdx++);
 +  }
 +#endif
++  // Texture arrays: GX textures are layers of array textures; the layer rides
++  // in tex{i}_size_bias.w of the uniform record.
++  const bool texArrays = gfx::texture_arrays_enabled();
++  const auto layerArg = [&](unsigned t) {
++    return texArrays ? fmt::format(" i32(ubuf.tex{}_size_bias.w),", t) : std::string{};
++  };
++  const auto atlasOpen = [&](unsigned) { return texArrays ? std::string{"flip_atlas_uv("} : std::string{}; };
++  const auto atlasClose = [&](unsigned t) { return texArrays ? fmt::format(", ubuf.tex{}_atlas)", t) : std::string{}; };
    // Load points for line/point expansion
    std::string_view vidxAttr = "vidx"sv;
    if (config.lineMode != 0) {
-@@ -990,6 +1036,10 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+@@ -990,6 +1046,10 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
      }
      vidxAttr = "in_vidx"sv;
    } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
@@ -6778,17 +9242,47 @@ index 92f358b..7a9449a 100644
      vtxXfrAttrsPre += "\n    let in_pnmtxidx = imm.current_pnmtx;";
    }
  
-@@ -1576,11 +1626,36 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+@@ -1335,9 +1395,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+                     ind_scale(indStage.scaleS), ind_scale(indStage.scaleT), texMapId);
+     fragmentFnPre += fmt::format(
+         "\n    // Indirect stage {0}"
+-        "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
++        "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {4}{2}{5},{3} "
+         "ubuf.tex{1}_size_bias.z).abg;",
+-        i, texMapId, scaleExpr);
++        i, texMapId, scaleExpr, layerArg(texMapId), atlasOpen(texMapId), atlasClose(texMapId));
+   }
+   if (info.usedIndStages.any()) {
+     fragmentFnPre += "\n    var t_TexCoord = vec2f(0.0);";
+@@ -1515,8 +1575,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
+     }
+     fragmentFnPre +=
+-        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
+-                    underlying(stage.texMapId), uvIn);
++        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {4}{2}{5},{3} ubuf.tex{1}_size_bias.z);", i,
++                    underlying(stage.texMapId), uvIn, layerArg(underlying(stage.texMapId)),
++                    atlasOpen(underlying(stage.texMapId)), atlasClose(underlying(stage.texMapId)));
+   }
+   if (info.usesPTTexMtx.any()) {
+     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
+@@ -1576,17 +1637,48 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
    if (info.usedIndTexMtxs.any()) {
      uniBufAttrs += fmt::format("\n    ind_mtx: array<mat2x4f, {}>,", MaxIndTexMtxs);
    }
 +  const unsigned flipTextureCount=static_cast<unsigned>(info.sampledTextures.count());
 +  unsigned flipTextureRank=0;
++  if (texArrays) {
++    // Atlas textures: sample inside the texture's cell (one-texel gutter of
++    // replicated edge texels makes clamp filtering identical).
++    texBindings += "\nfn flip_atlas_uv(uv: vec2f, a: vec4f) -> vec2f {\n  if (a.w > 0.0) { return clamp(uv, vec2f(0.0), vec2f(1.0)) * a.zw + a.xy; }\n  return uv;\n}";
++  }
    for (int i = 0; i < info.sampledTextures.size(); ++i) {
      if (!info.sampledTextures.test(i)) {
        continue;
      }
      uniBufAttrs += fmt::format("\n    tex{}_size_bias: vec4f,", i);
++    uniBufAttrs += fmt::format("\n    tex{}_atlas: vec4f,", i);
 +#ifdef MELEE_MIYOO_FLIP
 +    if(config.flipFlags & FlipTexturePairs) {
 +      const unsigned bankCount=15/flipTextureCount;
@@ -6796,26 +9290,34 @@ index 92f358b..7a9449a 100644
 +        const unsigned slot=bank*flipTextureCount+flipTextureRank;
 +        texBindings += fmt::format(
 +            "\n@group(2) @binding({1})\n"
-+            "var tex{0}_bank{3}: texture_2d<f32>;\n"
++            "var tex{0}_bank{3}: {4};\n"
 +            "@group(2) @binding({2})\n"
 +            "var tex{0}_bank{3}_samp: sampler;",
-+            i,slot*2,slot*2+1,bank);
++            i,slot*2,slot*2+1,bank,texArrays?"texture_2d_array<f32>":"texture_2d<f32>");
 +      }
-+      texBindings += fmt::format("\nfn flip_sample{}(uv: vec2f, bias: f32) -> vec4f {{\n  switch flip_texture_bank {{",i);
++      texBindings += fmt::format("\nfn flip_sample{}(uv: vec2f,{} bias: f32) -> vec4f {{\n  switch flip_texture_bank {{",i,texArrays?" layer: i32,":"");
 +      for(unsigned bank=0;bank<bankCount;++bank)
 +        texBindings += fmt::format(
-+            "\n    case {1}u: {{ return textureSampleBias(tex{0}_bank{1}, tex{0}_bank{1}_samp, uv, bias); }}",
-+            i,bank);
++            "\n    case {1}u: {{ return textureSampleBias(tex{0}_bank{1}, tex{0}_bank{1}_samp, uv,{2} bias); }}",
++            i,bank,texArrays?" layer,":"");
 +      texBindings += fmt::format(
-+          "\n    default: {{ return textureSampleBias(tex{0}_bank0, tex{0}_bank0_samp, uv, bias); }}\n  }}\n}}",i);
++          "\n    default: {{ return textureSampleBias(tex{0}_bank0, tex{0}_bank0_samp, uv,{1} bias); }}\n  }}\n}}",i,texArrays?" layer,":"");
 +      ++flipTextureRank;
 +      continue;
 +    }
 +#endif
      texBindings += fmt::format(
          "\n@group(2) @binding({1})\n"
-         "var tex{0}: texture_2d<f32>;\n"
-@@ -1628,7 +1703,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+-        "var tex{0}: texture_2d<f32>;\n"
++        "var tex{0}: {3};\n"
+         "@group(2) @binding({2})\n"
+         "var tex{0}_samp: sampler;",
+-        i, i * 2, i * 2 + 1);
++        i, i * 2, i * 2 + 1, texArrays ? "texture_2d_array<f32>" : "texture_2d<f32>");
+   }
+   if (!prevColorNormalized && !prevAlphaNormalized) {
+     fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
+@@ -1628,7 +1720,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
      fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
    }
  
@@ -6824,7 +9326,7 @@ index 92f358b..7a9449a 100644
  fn bswap32(v: u32, le: bool) -> u32 {{
    if (le) {{
      return v;
-@@ -1998,6 +2073,59 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
+@@ -1998,6 +2090,99 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
  )""",
                                          uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
                                          fragmentFnPre, vtxXfrAttrsPre, uniformPre);
@@ -6837,9 +9339,16 @@ index 92f358b..7a9449a 100644
 +    }
 +  };
 +  if(config.flipFlags & FlipVertexInput) {
-+    replace("@builtin(vertex_index) vidx: u32,", "");
-+    replace(",\n    @builtin(instance_index) iidx: u32", "");
-+    replace("var out: VertexOutput;", config.lineMode ? "var out: VertexOutput; let vidx = flip_matrices.z >> 24u; let iidx = 0u;" : "var out: VertexOutput;");
++    if(config.flipFlags & FlipInstancedPoints) {
++      // Instanced points: attributes step per instance (one record per point);
++      // the quad corner is the vertex index of the shared 6-index quad.
++      replace(",\n    @builtin(instance_index) iidx: u32", "");
++      replace("var out: VertexOutput;", "var out: VertexOutput; let iidx = 0u;");
++    } else {
++      replace("@builtin(vertex_index) vidx: u32,", "");
++      replace(",\n    @builtin(instance_index) iidx: u32", "");
++      replace("var out: VertexOutput;", config.lineMode ? "var out: VertexOutput; let vidx = flip_matrices.z >> 24u; let iidx = 0u;" : "var out: VertexOutput;");
++    }
 +  }
 +  if(config.flipFlags & FlipUniformTable) {
 +    // The wrapper fixes the stride without duplicating Uniform's WGSL layout.
@@ -6849,6 +9358,39 @@ index 92f358b..7a9449a 100644
 +    // immediates in both stages, so every table access is dynamically uniform
 +    // instead of indexed by a per-fragment varying.
 +    const bool constantRecord = (config.flipFlags & FlipConstantRecord) != 0;
++    // Experiment (MELEE_FLIP_FS_VARYING_CONSTANTS=1): the vertex stage reads the
++    // TEV constants (konst colors, register initial values) from the
++    // dynamically indexed record and hands them to the fragment stage as flat
++    // varyings, so the fragment shader has no dynamically indexed UBO loads for
++    // them. Skipped when the inter-stage location budget (15) would overflow.
++    static const bool varyingConstants = [] { const char* v = std::getenv("MELEE_FLIP_FS_VARYING_CONSTANTS"); return v && v[0] == '1'; }();
++    if (varyingConstants && (config.flipFlags & FlipBatchedDraws) && !constantRecord) {
++      std::vector<std::string> names;
++      for (const char* base : {"kcolor0", "kcolor1", "kcolor2", "kcolor3", "tevprev", "tevreg0", "tevreg1", "tevreg2"})
++        if (uniBufAttrs.find(fmt::format("\n    {}: vec4f,", base)) != std::string::npos) names.emplace_back(base);
++      const size_t fsPos = shaderSource.find("fn fs_main(");
++      if (!names.empty() && vtxOutIdx + names.size() <= 15 && fsPos != std::string::npos) {
++        std::string outs, assigns;
++        for (const auto& name : names) {
++          outs += fmt::format("\n    @location({}) @interpolate(flat, either) flip_c_{}: vec4f,", vtxOutIdx++, name);
++          assigns += fmt::format("\n    out.flip_c_{0} = ubuf.{0};", name);
++        }
++        replace("struct VertexOutput {\n    @builtin(position) pos: vec4f,", "struct VertexOutput {\n    @builtin(position) pos: vec4f," + outs);
++        const size_t ret = shaderSource.find("    return out;\n}");
++        if (ret != std::string::npos) shaderSource.insert(ret, assigns + "\n");
++        std::string fs = shaderSource.substr(shaderSource.find("fn fs_main("));
++        for (const auto& name : names) {
++          const std::string from = "ubuf." + name, to = "in.flip_c_" + name;
++          for (size_t pos = fs.find(from); pos != std::string::npos; pos = fs.find(from, pos + to.size())) {
++            // Whole-token match: the next character must not extend the name.
++            const char next = pos + from.size() < fs.size() ? fs[pos + from.size()] : ' ';
++            if (std::isalnum(static_cast<unsigned char>(next)) || next == '_') { pos += from.size(); continue; }
++            fs.replace(pos, from.size(), to);
++          }
++        }
++        shaderSource.replace(shaderSource.find("fn fs_main("), std::string::npos, fs);
++      }
++    }
 +    replace("ubuf.", (config.flipFlags & FlipBatchedDraws) ? "flip_uniform_table[flip_record_index].value." : "flip_uniform_table[imm._pad].value.");
 +    if(config.flipFlags & FlipBatchedDraws) {
 +      replace("struct VertexOutput {", "var<private> flip_record_index: u32;\nstruct VertexOutput {");
@@ -6885,7 +9427,7 @@ index 92f358b..7a9449a 100644
      Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
    }
 diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
-index c74bd6d..a4c8930 100644
+index c74bd6d..e3baf93 100644
 --- a/lib/gx/shader_info.cpp
 +++ b/lib/gx/shader_info.cpp
 @@ -1,3 +1,7 @@
@@ -6896,7 +9438,17 @@ index c74bd6d..a4c8930 100644
  #include "shader_info.hpp"
  
  #include "../gfx/recording.hpp"
-@@ -218,6 +222,16 @@ u32 line_texcoord_mask() noexcept {
+@@ -23,7 +27,8 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
+     const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
+     vpBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
+   }
+-  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
++  // .w: array layer of the texture (texture arrays), 0 otherwise.
++  return {width, height, tex.texObj.lod_bias() + vpBias, tex.ref ? static_cast<float>(tex.ref->layer) : 0.0f};
+ }
+ 
+ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
+@@ -218,6 +223,16 @@ u32 line_texcoord_mask() noexcept {
  ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
    ZoneScoped;
  
@@ -6913,7 +9465,27 @@ index c74bd6d..a4c8930 100644
    ShaderInfo info{
        // render/logical viewport size, proj
        .uniformSize = 8 + 8 + 64,
-@@ -492,11 +506,19 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+@@ -361,7 +376,8 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+   if (info.usedIndTexMtxs.any()) {
+     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
+   }
+-  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
++  // tex{i}_size_bias and tex{i}_atlas per sampled texture.
++  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>) * 2;
+   info.uniformSize = gfx::align_uniform(info.uniformSize);
+   if (info.uniformSize > MaxUniformSize) {
+     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
+@@ -488,15 +504,28 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+     if (!info.sampledTextures.test(i)) {
+       continue;
+     }
+-    buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
++    const auto& texture = get_texture(static_cast<GXTexMapID>(i));
++    buf.append(texture_size_bias(texture));
++    // Atlas remap: clamp(uv) * zw + xy when w > 0, identity otherwise.
++    const auto* ref = texture ? texture.ref.get() : nullptr;
++    buf.append(ref && ref->atlas ? Vec4{ref->atlasOffsetX, ref->atlasOffsetY, ref->atlasScaleX, ref->atlasScaleY}
++                                 : Vec4{0.f, 0.f, 1.f, 0.f});
    }
  }
  
@@ -6947,7 +9519,7 @@ index 24d431b..51a5c84 100644
  u8 color_channel(GXChannelID id) noexcept;
  }; // namespace aurora::gx
 diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
-index a56709a..2b39c96 100644
+index a56709a..e23f8bb 100644
 --- a/lib/gx/texture.cpp
 +++ b/lib/gx/texture.cpp
 @@ -10,6 +10,9 @@
@@ -6960,14 +9532,30 @@ index a56709a..2b39c96 100644
  
  #include <algorithm>
  #include <atomic>
-@@ -51,8 +54,55 @@ struct CachedTextureEntry {
+@@ -51,8 +54,71 @@ struct CachedTextureEntry {
    u32 tlutDataVersion = 0;
    uint64_t replacementId = 0;
    uint64_t lastUsedFrame = 0;
 +  uint64_t sampleHash = 0; // Flip: sampled content fingerprint verified on reuse
++  uint64_t lastVerifiedFrame = 0;
  };
  
 +#ifdef MELEE_MIYOO_FLIP
++// Content verification costs ~15 % of the FIFO worker on Fountain when every
++// bind re-hashes. MELEE_FLIP_TEXTURE_VERIFY_INTERVAL (default 4) re-hashes a
++// texture object at most once per N frames; texDataVersion changes still
++// invalidate immediately.
++bool verify_due(CachedTextureEntry& entry, uint64_t frame) {
++  static const uint64_t interval = [] {
++    const char* v = std::getenv("MELEE_FLIP_TEXTURE_VERIFY_INTERVAL");
++    const long n = v ? std::atol(v) : 4;
++    return n < 1 ? 1ull : static_cast<uint64_t>(n);
++  }();
++  if (interval <= 1) return true;
++  if (frame - entry.lastVerifiedFrame < interval) return false;
++  entry.lastVerifiedFrame = frame;
++  return true;
++}
 +// Sampled content fingerprint (Dolphin "fast" texture-cache style): small
 +// sources are hashed completely, larger ones through 32 spread samples plus
 +// the tail. Object identities are derived from image descriptions, so this is
@@ -7016,11 +9604,64 @@ index a56709a..2b39c96 100644
  struct CachedTlutTextureEntry {
    gfx::TextureHandle handle;
    u32 tlutDataVersion = 0;
-@@ -211,6 +261,13 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
+@@ -74,20 +140,41 @@ struct TextureContentKey {
+   XXH128_hash_t tlutHash{};
+   u32 tlutFormat = 0;
+   u16 tlutEntries = 0;
++  // Texture atlas class (0 = plain array/2D texture). An atlas texture bakes
++  // clamp sampling into its placement, so objects of another sampler class
++  // (e.g. REPEAT users of the same image) must not share it.
++  u64 samplerClass = 0;
+ 
+   bool operator==(const TextureContentKey& rhs) const noexcept {
+     return textureHash.low64 == rhs.textureHash.low64 && textureHash.high64 == rhs.textureHash.high64 &&
+            width == rhs.width && height == rhs.height && format == rhs.format && mipCount == rhs.mipCount &&
+            tlutHash.low64 == rhs.tlutHash.low64 && tlutHash.high64 == rhs.tlutHash.high64 &&
+-           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries;
++           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries && samplerClass == rhs.samplerClass;
+   }
+ 
+   template <typename H>
+   friend H AbslHashValue(H h, const TextureContentKey& key) {
+     return H::combine(std::move(h), key.textureHash.low64, key.textureHash.high64, key.width, key.height, key.format,
+-                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries);
++                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries,
++                      key.samplerClass);
+   }
+ };
++// Array/atlas class of a texture: sampler state, plus atlas eligibility for
++// clamp-wrapped single-mip textures (their sampling can be remapped exactly).
++static uint64_t texture_group_key(const GXTexObj_& obj) {
++  if (obj.wrap_s() == GX_CLAMP && obj.wrap_t() == GX_CLAMP && obj.mip_count() == 1) {
++    // Single-mip clamp textures: the sampler reduces to mag/min filter and
++    // anisotropy (TextureBind::get_descriptor normalizes the rest), so all such
++    // textures of one format share an atlas class.
++    const auto minFilter = obj.min_filter();
++    const bool minLinear = minFilter == GX_LINEAR || minFilter == GX_LIN_MIP_NEAR || minFilter == GX_LIN_MIP_LIN;
++    return gfx::TextureAtlasEligible | (obj.mag_filter() == GX_LINEAR ? 1u : 0u) | (minLinear ? 2u : 0u) |
++           (static_cast<uint64_t>(obj.max_aniso()) << 2);
++  }
++  // Plain class: the sampler-relevant mode bits, with the atlas flag bit kept
++  // clear (mode1 bit 31 would otherwise alias it).
++  return (obj.mode0 | (static_cast<uint64_t>(obj.mode1) << 32)) & ~gfx::TextureAtlasEligible;
++}
+ 
+ struct ContentCacheEntry {
+   gfx::TextureHandle handle;
+@@ -126,6 +213,7 @@ uint64_t s_contentCacheBytes = 0;
+ uint64_t s_contentCacheBudgetBytes = texture::ContentCacheBudgetBytes;
+ uint64_t s_frameCount = 0;
+ uint64_t s_bindGeneration = 1;
++uint64_t s_textureRefChanges = 0;
+ std::atomic<uint64_t> s_pendingInvalidations = 0;
+ std::atomic<uint64_t> s_pendingCacheClears = 0;
+ TextureStats s_stats;
+@@ -211,6 +299,14 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
    entry.tlutDataVersion = tlutDataVersion;
    entry.replacementId = replacementId;
    entry.lastUsedFrame = s_frameCount;
 +#ifdef MELEE_MIYOO_FLIP
++  entry.lastVerifiedFrame = s_frameCount;
 +  if (obj.has_data()) {
 +    const GXTlutObj_* tlut = nullptr;
 +    if (tlutObjId != 0 && static_cast<size_t>(obj.tlut) < g_gxState.loadedTluts.size()) tlut = &g_gxState.loadedTluts[static_cast<size_t>(obj.tlut)];
@@ -7030,7 +9671,7 @@ index a56709a..2b39c96 100644
  
    if (tlutObjId != 0) {
      auto& cache = s_tlutObjectCaches[tlutObjId];
-@@ -281,6 +338,9 @@ struct TextureKeys {
+@@ -281,15 +377,20 @@ struct TextureKeys {
  TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bool buildSourceKey) {
    ZoneScoped;
    const size_t textureBytes = texture::texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
@@ -7040,33 +9681,63 @@ index a56709a..2b39c96 100644
    CHECK(obj.has_data() && textureBytes != 0, "invalid texture source for content hash");
  
    TextureKeys keys;
-@@ -598,7 +658,11 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
++  const uint64_t groupKey = texture_group_key(obj);
+   keys.contentKey = {
+       .textureHash = XXH3_128bits(obj.data, textureBytes),
+       .width = obj.width(),
+       .height = obj.height(),
+       .format = obj.format(),
+       .mipCount = obj.mip_count(),
++      .samplerClass = (groupKey & gfx::TextureAtlasEligible) ? groupKey : 0,
+   };
+   s_stats.hashedBytes += textureBytes;
+ 
+@@ -598,7 +699,11 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
    if (obj.texObjId != 0) {
      if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
        auto& entry = it->second;
 -      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
 +      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0
 +#ifdef MELEE_MIYOO_FLIP
-+          && (!entry.sampleHash || entry.sampleHash == sample_hash_texture(obj, nullptr))
++          && (!entry.sampleHash || !verify_due(entry, s_frameCount) || entry.sampleHash == sample_hash_texture(obj, nullptr))
 +#endif
 +      ) {
          entry.lastUsedFrame = s_frameCount;
          ++s_stats.objectHits;
          return entry.handle;
-@@ -649,7 +713,11 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+@@ -630,7 +735,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+ #endif
+       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+-                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
++                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr,
++                                          texture_group_key(obj));
+       ++s_stats.misses;
+       s_stats.uploadBytes += texture_handle_size(handle);
+       cache_content_texture(std::move(keys->contentKey), handle);
+@@ -649,7 +755,11 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
      if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
        auto& entry = it->second;
        if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
 -          entry.tlutDataVersion == tlut.tlutDataVersion) {
 +          entry.tlutDataVersion == tlut.tlutDataVersion
 +#ifdef MELEE_MIYOO_FLIP
-+          && (!entry.sampleHash || entry.sampleHash == sample_hash_texture(obj, &tlut))
++          && (!entry.sampleHash || !verify_due(entry, s_frameCount) || entry.sampleHash == sample_hash_texture(obj, &tlut))
 +#endif
 +      ) {
          entry.lastUsedFrame = s_frameCount;
          if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
            tlutIt->second.lastUsedFrame = s_frameCount;
-@@ -835,6 +903,9 @@ void evict_copy_texture(const void* dest) noexcept {
+@@ -685,7 +795,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+       }
+       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                           {converted.data.data(), converted.data.size()}, false,
+-                                          "GX Static Palette Texture");
++                                          "GX Static Palette Texture", texture_group_key(obj));
+       handle->hasArbitraryMips = converted.hasArbitraryMips;
+       ++s_stats.misses;
+       s_stats.uploadBytes += texture_handle_size(handle);
+@@ -835,6 +945,9 @@ void evict_copy_texture(const void* dest) noexcept {
  }
  
  void resolve_sampled_textures(const ShaderInfo& info) noexcept {
@@ -7076,8 +9747,37 @@ index a56709a..2b39c96 100644
    ZoneScoped;
    apply_pending_invalidations();
  
+@@ -854,6 +967,11 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+     gfx::TextureHandle handle;
+     const auto copyIt = g_gxState.copyTextures.find(obj.data);
+     const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
++#ifdef MELEE_MIYOO_FLIP
++    if (copyRef != nullptr) {
++      gfx::flip_fusion_texture_bound(copyRef->handle);
++    }
++#endif
+     if (is_palette_format(obj.format())) {
+       const auto tlutIdx = static_cast<size_t>(obj.tlut);
+       if (tlutIdx < g_gxState.loadedTluts.size()) {
+@@ -873,7 +991,16 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+     }
+ 
+     obj.mFormat = resolved_format_for_handle(handle);
++    // Texture arrays: a different texture in the same array keeps the bind
++    // group but changes the record (layer, size, bias). Count it.
++    if (textureBind.ref.get() != handle.get() || textureBind.texObj.width() != obj.width() ||
++        textureBind.texObj.height() != obj.height() || textureBind.texObj.mode1 != obj.mode1) {
++      ++s_textureRefChanges;
++    }
+     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
+   }
+ }
++namespace texture {
++uint64_t texture_ref_changes() noexcept { return s_textureRefChanges; }
++} // namespace texture
+ } // namespace aurora::gx
 diff --git a/lib/gx/texture.hpp b/lib/gx/texture.hpp
-index 29c9a48..bd88f6a 100644
+index 29c9a48..667c288 100644
 --- a/lib/gx/texture.hpp
 +++ b/lib/gx/texture.hpp
 @@ -25,7 +25,13 @@ const TextureStats& texture_stats() noexcept;
@@ -7094,6 +9794,14 @@ index 29c9a48..bd88f6a 100644
  constexpr bool AsyncTextureReplacements = true;
  constexpr uint32_t ReplacementThumbnailDim = 64;
  constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
+@@ -35,6 +41,7 @@ size_t tlut_source_size(u16 numEntries) noexcept;
+ 
+ void invalidate_bindings() noexcept;
+ uint64_t current_bind_generation() noexcept;
++uint64_t texture_ref_changes() noexcept; // bumps when a bound texture's handle/size/lod changes
+ void invalidate_replacement(uint64_t replacementId) noexcept;
+ void end_frame() noexcept;
+ void shutdown() noexcept;
 diff --git a/lib/imgui.cpp b/lib/imgui.cpp
 index 494640b..b166a1d 100644
 --- a/lib/imgui.cpp
@@ -7129,7 +9837,7 @@ index a11a7f8..e173f0d 100644
  void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
  } // namespace aurora::imgui
 diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
-index 592b8ab..c250b3d 100644
+index 592b8ab..9fb780f 100644
 --- a/lib/webgpu/gpu.cpp
 +++ b/lib/webgpu/gpu.cpp
 @@ -1,4 +1,9 @@
@@ -7222,3 +9930,18 @@ index 592b8ab..c250b3d 100644
      constexpr std::array disableToggles{
          "timestamp_quantization",
      };
+@@ -1033,7 +1064,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+       .surfaceConfiguration =
+           wgpu::SurfaceConfiguration{
+               .format = surfaceFormat,
++#ifdef MELEE_MIYOO_FLIP
++              // The scene renders straight into the presented texture, which
++              // EFB copies then sample and the capture path copies from.
++              .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
++                       wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
++#else
+               .usage = wgpu::TextureUsage::RenderAttachment,
++#endif
+               .width = size.native_fb_width,
+               .height = size.native_fb_height,
+               .presentMode = presentMode,
