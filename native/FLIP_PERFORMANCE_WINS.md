@@ -148,6 +148,42 @@ FIFO worker; FIFO worker 28.6 ms; render worker 25.1 ms; GPU 11.3 ms.
 | Dawn `disable_robustness` | no change |
 | Pipeline prewarming | crashes at startup; must stay off |
 
+## Chart
+
+`native/validation/2026-09-14-flip/onett-frame-time.png` plots the frozen-Onett
+frame time per optimization (log scale), with markers colored by where each
+change lives: Aurora PR set, Dawn escape hatch / direct GLES, or platform.
+Data: `onett-frame-time.csv` next to it; regenerate with
+`native/tools/plot_onett_frame_time.py <csv> <png>` (needs matplotlib).
+
+## Aurora-only estimate
+
+What the upstream Aurora PR set (`integration/flip-prs`: vertex loaders,
+resident display lists, stable texture identities, pipeline memo, async frames,
+instanced points, texture arrays + atlas, pass fusion, ImGui skip) buys on the
+Flip without the Dawn escape hatch, direct GLES, mapped GL streams, FBO cache,
+swapchain pool, present worker, dirty uploads, scene-on-surface, or half-res
+sprites. This is an estimate; the `miyoo-flip-aurora-prs` melee branch exists to
+measure it.
+
+- Fully captured: the GX translation side. The FIFO worker went 28.6 -> ~9 ms
+  through loaders, resident lists, texture identities, memo and instanced
+  points, all in the PR set, and async frames removes the 22 ms/frame join.
+- Partly captured: draws 360 -> ~271 and passes 7 -> 4 (arrays, atlas, fusion,
+  ImGui skip) shrink whatever the render path costs per draw and per pass.
+- Not captured: the render worker still runs Dawn's GL backend. The last
+  measurement of that path on this device (v5x, ~450 draws, 7 passes) was a
+  49.6 ms frame, render-worker bound, before direct GLES took it to 38.6 and the
+  Dawn-side fixes to ~15 ms.
+- Estimate: game ~5 ms and FIFO ~9 ms no longer matter; the frame is the Dawn GL
+  render worker at ~270 draws and 4 passes, roughly 28-35 ms, i.e. ~30 FPS on
+  Onett versus 17 ms / 58 FPS with everything. In milliseconds that is about
+  94% of the 309.6 -> 17.1 reduction, but only about half the final frame rate.
+- On targets with a Vulkan driver (Raspberry Pi 4/5, most phones) Aurora's
+  Vulkan backend has far lower per-draw CPU cost than the Mali GLES blob through
+  Dawn GL, so the PR set alone should land much closer to the full result there;
+  the escape hatch exists because this device has GLES only.
+
 ## Upstream candidates
 
 Backend-independent and generic to any GX game on Aurora: specialized vertex
