@@ -215,6 +215,18 @@ reuse and redundant-state filtering in the GL backend. The last stretch from
 ~25 ms to 13 ms came from bypassing Dawn's command execution entirely and has
 no WebGPU-level equivalent.
 
+## Dawn-side candidates: measured (2026-09-15)
+
+The three Dawn changes proposed for encounter/dawn were bisected on the device
+in the Aurora-only build (render work per frame net of the display wait):
+EGL surface source only 47.1 ms; plus swapchain storage ring 46.8 ms (neutral);
+plus framebuffer object cache 57.0 ms (regression: the render thread blocks
+inside GL calls, most likely because render targets stay attached to live
+framebuffers while Dawn's copy paths read them); all three 56.4 ms. The ~2 ms
+FBO-cache win in this document came from the direct GLES path with its own copy
+paths and does not transfer to Dawn's command execution on this driver. The
+Flip's "Melee Native Dev" listing runs the surface-source + ring variant.
+
 ## Upstream candidates
 
 Backend-independent and generic to any GX game on Aurora: specialized vertex
