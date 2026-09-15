@@ -184,6 +184,37 @@ measure it.
   Dawn GL, so the PR set alone should land much closer to the full result there;
   the escape hatch exists because this device has GLES only.
 
+## Aurora-only: measured (2026-09-14, v151-aurora-prs on the device)
+
+The estimate above was too optimistic. Same trial script, same device, same
+session, frozen Onett:
+
+| Build | Presented FPS | Frame | Game thread | Render worker |
+| --- | --- | --- | --- | --- |
+| v150 (full stack: direct GLES, Dawn hooks) | 58.5-59.1 | 17.1 ms | ~5 ms | ~13 ms |
+| v151-aurora-prs, warm shader cache | 18.6-19.5 | ~50 ms | 4.6 ms, then 47.6 ms waiting in begin_frame | ~50 ms |
+| v151-aurora-prs + MELEE_FLIP_ASYNC_PRESENT=1 | 21.2-21.4 | ~46 ms | 4.7 ms, 42 ms waiting | ~44 ms |
+
+CPU samples of the Aurora-only render worker (12 s, 7,664 samples): **libmali
+70%**, Dawn core + GL backend 19% (BindGroupTracker::Apply, ExecuteRenderPass,
+VertexStateBufferBindingTracker::Apply, RefCounted, SyncScopeUsageTracker),
+libc 8%, Aurora's own render code under 1%. With the direct path the same
+worker was ~13 ms with libmali at 62%. So the Mali driver spends about four
+times longer on the same ~270 draws and 4 passes when Dawn's GL backend drives
+it: a `glBindBufferRange` per draw for the dynamic-offset uniform (on this blob
+any per-draw uniform change costs as much as the draw), bind groups re-applied
+per draw, FBO gen/attach/check/delete per pass, and no redundant-state
+filtering. The GX translation side is fine: the FIFO worker is no longer on the
+critical path. The synchronous DRM flip on the render worker costs ~4 ms.
+
+What could still move upstream (WebGPU-level, generic): the first-iteration
+uniform table (64 KiB windows of 4 KiB records, one bind per pass, record index
+in the vertex stream) plus adjacent-draw batching, which removes the per-draw
+UBO rebind and merges draws; on the Dawn side the FBO cache, swapchain texture
+reuse and redundant-state filtering in the GL backend. The last stretch from
+~25 ms to 13 ms came from bypassing Dawn's command execution entirely and has
+no WebGPU-level equivalent.
+
 ## Upstream candidates
 
 Backend-independent and generic to any GX game on Aurora: specialized vertex
